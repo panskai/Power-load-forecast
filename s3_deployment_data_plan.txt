@@ -1,0 +1,94 @@
+﻿AWS S3 数据落地方案
+====================
+
+一、总体思路
+-----------
+- 以电站为最小管理单元，在 S3 中划分独立的 plant 目录，集中存放该站点的历史数据、特征数据、系统配置、模型资产以及预测/调度结果。
+- 数据流程：现场/外部系统 → 原始数据落地到 `raw/` → ETL 生成标准 15 分钟粒度的 `processed/` → 触发模型预测 → 预测结果、调度计划和评估指标写回 `predictions/`。
+- 模型运行依赖的辅助文件（Scaler、系统配置、实验参数等）统一放在 `config/` 与 `features/` 下，确保在线预测和滚动调度模块可以直接读取。
+
+二、S3 目录结构（示例 bucket：s3://smart-grid-ops）
+-------------------------------------------
+```
+smart-grid-ops/
+  plants/
+    {plant_id}/
+      raw/
+        load/{yyyy}/{mm}/load_{yyyyMMdd}.parquet
+        pv/{yyyy}/{mm}/pv_{yyyyMMdd}.parquet
+        storage/{yyyy}/{mm}/storage_{yyyyMMdd}.parquet
+        diesel/{yyyy}/{mm}/diesel_{yyyyMMdd}.parquet
+        weather/{yyyy}/{mm}/weather_{yyyyMMdd}.json
+        market/{yyyy}/{mm}/price_{yyyyMMdd}.parquet      # 可选：电价、燃料价格
+      processed/
+        forecasts_inputs/{date}/features_{timestamp}.parquet
+        scalers/scaler_{plant_id}.pkl
+        train_val_test/{Area1_train,val,test}.csv        # 与仓库中格式保持一致
+        feature_logs/feature_quality_{date}.json
+      config/
+        system_config.json                               # dispatching.create_system_config 输出
+        asset_register.yaml                              # 光伏、储能、柴发等设备额定信息
+        dispatch_params.json                             # 调度窗口、反馈系数等运行参数
+      models/
+        checkpoints/{model_type}/best_model.pth
+        configs/{model_type}/config.json
+      predictions/
+        load_forecast/{date}/forecast_{timestamp}.parquet
+        dispatch_plan/{date}/dispatch_{timestamp}.parquet
+        metrics/{date}/metrics_{timestamp}.json
+        visualizations/{date}/comparison_{timestamp}.png
+      logs/
+        inference/{date}/inference_{timestamp}.log
+        dispatch/{date}/dispatch_{timestamp}.log
+```
+
+三、各类原始数据要求（raw/）
+----------------------
+| 设备类型 | 必备字段 | 说明 |
+| -------- | ------- | ---- |
+| 负载（load） | timestamp, load_mw, status | 采集频率 ≥ 1 分钟；ETL 汇总为 15 分钟平均或总量，与模型输入一致 |
+| 光伏（pv） | timestamp, pv_power_mw, irradiation, temperature | 用于评估可用清洁功率，可作为附加特征或约束上限 |
+| 储能（storage） | timestamp, soc, charge_power, discharge_power, availability | 支撑调度模型的 SOC 约束、效率估计及滚动反馈 |
+| 柴发（diesel） | timestamp, output_mw, fuel_rate, status | 记录机组状态、最低输出、燃料消耗，用于成本估算与限制 |
+| 天气（weather） | timestamp, temp, humidity, rain, wind_speed, forecast_horizon | 模型当前使用 temp_avg/humidity/rain；可额外保留风速、预报时长 |
+| 市场/燃料（market） | timestamp, price_type, price | 可选，用于成本分析或未来扩展 |
+
+四、标准化数据（processed/）
+--------------------
+1. `forecasts_inputs/`：将 `raw/` 中数据对齐到 15 分钟粒度后，生成模型需要的输入列（datetime, load, temp_avg, humidity, rain, area等），存储为 Parquet/CSV，供在线推理批量读入。
+2. `scalers/`：保存训练时的 StandardScaler/MinMaxScaler pickle，确保在线预测和滚动优化与训练一致。
+3. `train_val_test/`：保留历史训练集、验证集、测试集（CSV）以便重训或质量回放。
+4. `feature_logs/`：记录特征合规性检查（缺失、异常、对齐），方便监控数据质量。
+
+五、系统配置与模型资产（config/ & models/）
+--------------------------------
+- `system_config.json`：包含机组、储能的成本系数、功率约束、效率、碳排系数等，与 `optimal_dispatch.py` 中的约束/目标对应。
+- `asset_register.yaml`：存放光伏、储能、柴发的额定功率、调度优先级、效率衰减等资产信息，便于运营与配置自动化。
+- `dispatch_params.json`：窗口长度、步长、反馈系数、预测方法等运行参数，供 `EnhancedRollingOptimizer` 读取。
+- `models/`：存放最优模型权重 (`best_model.pth`) 与对应配置 (`config.json`)；按模型类型分目录，以支持多版本对比。
+
+六、预测 & 调度结果输出（predictions/）
+-----------------------------
+1. `load_forecast/`: 记录模型对未来窗口的负荷预测，字段示例
+   - timestamp, forecast_horizon, predicted_load_mw, prediction_upper, prediction_lower, model_version
+2. `dispatch_plan/`: 滚动优化得到的调度计划
+   - timestamp, horizon_idx, pv_setpoint, storage_charge_mw, storage_discharge_mw, storage_soc, diesel_output_mw, grid_purchase_mw, curtailment, compensation, total_cost
+3. `metrics/`: 保存 `compare_experiments` 与 `cost_analysis` 生成的指标
+   - overall_metrics (MAPE, RMSE, total_cost, carbon_emission, renewable_utilization 等)
+   - improvement_summary (cost_reduction_pct, emission_reduction_pct, adjustment_frequency_delta)
+4. `visualizations/`: 存放误差箱线图、成本柱状图、时间序列对比图等 PNG，以供报告/看板引用。
+
+七、落地部署建议
+---------------
+- 数据入湖：利用 AWS DMS/Kinesis/IoT Core 将现场 SCADA、光伏、电池、柴发、负载数据实时写入 S3 `raw/`；天气/市场数据通过 Lambda 定时拉取。
+- ETL 管道：Glue / EMR / Lambda 定时任务聚合 `raw/` → `processed/forecasts_inputs/`，并更新 scaler、系统参数变更时同步 `config/`。
+- 预测触发：当新的 `features_{timestamp}` 或天气预报入库后，通过 EventBridge 触发推理 Lambda / ECS 任务，拉取最新模型权重与特征，写回 `predictions/`。
+- 调度执行：滚动优化任务从 `predictions/load_forecast/` 与 `config/system_config.json` 读取数据，输出调度指令至 `dispatch_plan/`，并推送至现场执行系统（如 MQTT / REST）。
+- 成本评估：每日汇总 `metrics/`、`dispatch_plan/`，由 `DispatchCostAnalyzer` 输出报告存放在 `metrics/` 或另建 `reports/`。
+- 监控与版本：使用对象标签或 manifest 记录模型版本、数据版本，结合 CloudWatch/Lake Formation 实现访问控制与审计。
+
+八、输出文件
+-----------
+- 本说明已保存于 `dispatching_module_details.txt`
+- 本次 S3 落地方案保存于 `s3_deployment_data_plan.txt`
+- 所有文件位于仓库根目录，可直接查阅/同步至方案文档。

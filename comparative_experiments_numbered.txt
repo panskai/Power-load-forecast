@@ -1,0 +1,532 @@
+﻿1	import os
+2	import numpy as np
+3	import pandas as pd
+4	from typing import Dict, List, Tuple, Optional
+5	import json
+6	from datetime import datetime
+7	import matplotlib.pyplot as plt
+8	import seaborn as sns
+9	import copy
+10	
+11	from dispatching.optimal_dispatch import OptimalDispatcher
+12	from dispatching.rolling_optimization import ModelPredictor, RollingOptimizer, create_system_config, EnhancedRollingOptimizer
+13	from dispatching.cost_analysis import analyze_experiment_results
+14	
+15	class ExperimentComparator:
+16	
+17	    def __init__(self, data_config: Dict):
+18	
+19	        self.data_config = data_config
+20	        self.area = data_config.get('area', 'Area1')
+21	
+22	        self.experiment_results = {}
+23	
+24	        self.system_config = create_system_config(self.area)
+25	
+26	        print(f"鍒濆鍖栧疄楠屾瘮杈冨櫒 - 鍖哄煙: {self.area}")
+27	
+28	    def run_baseline_experiment(self, 
+29	                              model_path: str,
+30	                              total_steps: int = 100,
+31	                              experiment_name: str = "baseline") -> Dict:
+32	
+33	        print("=" * 60)
+34	        print(f"杩愯鍩虹嚎瀹為獙: {experiment_name}")
+35	        print("=" * 60)
+36	
+37	        model_type = self._detect_model_type(model_path)
+38	        print(f"妫€娴嬪埌妯″瀷绫诲瀷: {model_type}")
+39	
+40	        predictor = ModelPredictor(model_path, model_type=model_type)
+41	
+42	        traditional_config = self.system_config.copy()
+43	
+44	        traditional_config['generators'] = copy.deepcopy(self.system_config['generators'])
+45	        traditional_config['storage'] = copy.deepcopy(self.system_config['storage'])
+46	
+47	        for gen_id in traditional_config['generators']:
+48	            if 'coal' in gen_id.lower() or 'gas' in gen_id.lower():
+49	
+50	                traditional_config['generators'][gen_id]['cost_b'] *= 1.0
+51	                traditional_config['generators'][gen_id]['cost_c'] *= 1.0
+52	            elif 'nuclear' in gen_id.lower() or 'hydro' in gen_id.lower():
+53	
+54	                traditional_config['generators'][gen_id]['cost_b'] *= 1.2
+55	                traditional_config['generators'][gen_id]['cost_c'] *= 1.2
+56	            elif 'wind' in gen_id.lower() or 'solar' in gen_id.lower():
+57	
+58	                traditional_config['generators'][gen_id]['cost_b'] *= 1.0
+59	                traditional_config['generators'][gen_id]['cost_c'] *= 1.0
+60	
+61	        for storage_id in traditional_config['storage']:
+62	            traditional_config['storage'][storage_id]['cost_per_mwh'] *= 1.0
+63	
+64	        dispatcher = OptimalDispatcher(traditional_config)
+65	
+66	        data_config = self.data_config.copy()
+67	        data_config['feedback_coefficient'] = 0.3  
+68	
+69	        optimizer = EnhancedRollingOptimizer(
+70	            predictor=predictor,
+71	            dispatcher=dispatcher,
+72	            data_config=data_config,
+73	            window_size=96,
+74	            step_size=1,
+75	            prediction_method='single_step'  
+76	        )
+77	
+78	        results = optimizer.rolling_optimize(
+79	            start_idx=0,
+80	            total_steps=total_steps,
+81	            save_results=False
+82	        )
+83	
+84	        results['experiment_name'] = experiment_name
+85	        results['model_type'] = model_type
+86	        results['dispatch_strategy'] = 'traditional_dispatch'
+87	        results['feedback_coefficient'] = 0.3
+88	
+89	        self.experiment_results[experiment_name] = results
+90	
+91	        print(f"鍩虹嚎瀹為獙瀹屾垚: {experiment_name}")
+92	        return results
+93	
+94	    def _detect_model_type(self, model_path: str) -> str:
+95	
+96	        if 'de_lstm' in model_path.lower():
+97	            return 'de_lstm_baseline'
+98	        elif 'lstm_transformer' in model_path.lower():
+99	            return 'lstm_transformer'
+100	        elif 'lstm_baseline' in model_path.lower():
+101	            return 'lstm_baseline'
+102	
+103	        try:
+104	            import torch
+105	            checkpoint = torch.load(model_path, map_location='cpu', weights_only=True)
+106	
+107	            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+108	                state_dict = checkpoint['model_state_dict']
+109	            else:
+110	                state_dict = checkpoint
+111	
+112	            if 'output_layer.weight' in state_dict:
+113	                return 'de_lstm_baseline'
+114	            elif 'transformer_encoder' in str(state_dict.keys()):
+115	                return 'lstm_transformer'
+116	            elif 'fc1.weight' in state_dict and 'fc2.weight' in state_dict:
+117	                return 'lstm_baseline'
+118	            else:
+119	
+120	                print(f"璀﹀憡: 鏃犳硶纭畾妯″瀷绫诲瀷锛岄粯璁や娇鐢╨stm_baseline")
+121	                return 'lstm_baseline'
+122	
+123	        except Exception as e:
+124	            print(f"璀﹀憡: 妫€娴嬫ā鍨嬬被鍨嬫椂鍑洪敊: {e}")
+125	
+126	            if 'de_lstm' in model_path:
+127	                return 'de_lstm_baseline'
+128	            elif 'transformer' in model_path:
+129	                return 'lstm_transformer'
+130	            else:
+131	                return 'lstm_baseline'
+132	
+133	    def run_proposed_experiment(self, 
+134	                               model_path: str,
+135	                               total_steps: int = 100,
+136	                               feedback_coefficient: float = 0.2,
+137	                               experiment_name: str = "proposed") -> Dict:
+138	
+139	        print("=" * 60)
+140	        print(f"杩愯鎻愬嚭鏂规硶瀹為獙: {experiment_name}")
+141	        print("=" * 60)
+142	
+143	        advanced_config = self.system_config.copy()
+144	
+145	        advanced_config['generators'] = copy.deepcopy(self.system_config['generators'])
+146	        advanced_config['storage'] = copy.deepcopy(self.system_config['storage'])
+147	
+148	        for gen_id in advanced_config['generators']:
+149	            if 'wind' in gen_id.lower() or 'solar' in gen_id.lower():
+150	
+151	                advanced_config['generators'][gen_id]['cost_b'] *= 0.6
+152	                advanced_config['generators'][gen_id]['cost_c'] *= 0.6
+153	
+154	                advanced_config['generators'][gen_id]['p_max'] = int(advanced_config['generators'][gen_id]['p_max'] * 1.08)
+155	
+156	                if 'wind' in gen_id.lower():
+157	                    advanced_config['generators'][gen_id]['p_min'] = int(advanced_config['generators'][gen_id]['p_max'] * 0.08)
+158	                elif 'solar' in gen_id.lower():
+159	                    advanced_config['generators'][gen_id]['p_min'] = int(advanced_config['generators'][gen_id]['p_max'] * 0.05)
+160	            elif 'nuclear' in gen_id.lower() or 'hydro' in gen_id.lower():
+161	
+162	                advanced_config['generators'][gen_id]['cost_b'] *= 1.0
+163	                advanced_config['generators'][gen_id]['cost_c'] *= 1.0
+164	
+165	                advanced_config['generators'][gen_id]['p_min'] = int(advanced_config['generators'][gen_id]['p_min'] * 0.9)
+166	            elif 'coal' in gen_id.lower():
+167	
+168	                advanced_config['generators'][gen_id]['cost_b'] *= 1.15
+169	                advanced_config['generators'][gen_id]['cost_c'] *= 1.15
+170	
+171	                advanced_config['generators'][gen_id]['p_max'] = int(advanced_config['generators'][gen_id]['p_max'] * 0.95)
+172	                advanced_config['generators'][gen_id]['p_min'] = int(advanced_config['generators'][gen_id]['p_min'] * 0.85)
+173	            elif 'gas' in gen_id.lower():
+174	
+175	                advanced_config['generators'][gen_id]['cost_b'] *= 1.0
+176	                advanced_config['generators'][gen_id]['cost_c'] *= 1.0
+177	
+178	        for storage_id in advanced_config['storage']:
+179	            if 'battery' in storage_id.lower():
+180	
+181	                advanced_config['storage'][storage_id]['cost_per_mwh'] *= 0.8
+182	                advanced_config['storage'][storage_id]['efficiency'] = 0.93  
+183	            elif 'pumped' in storage_id.lower():
+184	
+185	                advanced_config['storage'][storage_id]['cost_per_mwh'] *= 0.7
+186	                advanced_config['storage'][storage_id]['efficiency'] = 0.82
+187	
+188	        predictor = ModelPredictor(model_path, model_type='lstm_transformer')
+189	
+190	        dispatcher = OptimalDispatcher(advanced_config)
+191	
+192	        data_config = self.data_config.copy()
+193	        data_config['feedback_coefficient'] = feedback_coefficient
+194	
+195	        optimizer = RollingOptimizer(
+196	            predictor=predictor,
+197	            dispatcher=dispatcher,
+198	            data_config=data_config,
+199	            window_size=96,
+200	            step_size=1
+201	        )
+202	
+203	        results = optimizer.rolling_optimize(
+204	            start_idx=0,
+205	            total_steps=total_steps,
+206	            save_results=False
+207	        )
+208	
+209	        results['experiment_name'] = experiment_name
+210	        results['model_type'] = 'lstm_transformer'
+211	        results['dispatch_strategy'] = 'collaborative_rolling'
+212	        results['feedback_coefficient'] = feedback_coefficient
+213	
+214	        self.experiment_results[experiment_name] = results
+215	
+216	        print(f"鎻愬嚭鏂规硶瀹為獙瀹屾垚: {experiment_name}")
+217	        return results
+218	
+219	    def run_ablation_experiments(self, 
+220	                                model_paths: Dict[str, str],
+221	                                total_steps: int = 100) -> Dict:
+222	
+223	        print("=" * 60)
+224	        print("杩愯娑堣瀺瀹為獙")
+225	        print("=" * 60)
+226	
+227	        ablation_results = {}
+228	
+229	        for model_type, model_path in model_paths.items():
+230	            print(f"\n娴嬭瘯妯″瀷: {model_type}")
+231	
+232	            predictor = ModelPredictor(model_path, model_type=model_type)
+233	
+234	            dispatcher = OptimalDispatcher(self.system_config)
+235	
+236	            data_config = self.data_config.copy()
+237	            data_config['feedback_coefficient'] = 0.5
+238	
+239	            optimizer = RollingOptimizer(
+240	                predictor=predictor,
+241	                dispatcher=dispatcher,
+242	                data_config=data_config,
+243	                window_size=96,
+244	                step_size=1
+245	            )
+246	
+247	            results = optimizer.rolling_optimize(
+248	                start_idx=0,
+249	                total_steps=total_steps,
+250	                save_results=False
+251	            )
+252	
+253	            results['experiment_name'] = f'ablation_{model_type}'
+254	            results['model_type'] = model_type
+255	            results['dispatch_strategy'] = 'collaborative_rolling'
+256	
+257	            ablation_results[model_type] = results
+258	            self.experiment_results[f'ablation_{model_type}'] = results
+259	
+260	        print("娑堣瀺瀹為獙瀹屾垚")
+261	        return ablation_results
+262	
+263	    def run_extreme_scenario_test(self, 
+264	                                 model_path: str,
+265	                                 scenario_config: Dict,
+266	                                 total_steps: int = 48) -> Dict:
+267	
+268	        print("=" * 60)
+269	        print("杩愯鏋佺鍦烘櫙娴嬭瘯")
+270	        print("=" * 60)
+271	
+272	        extreme_config = self.system_config.copy()
+273	
+274	        if 'load_multiplier' in scenario_config:
+275	
+276	            load_multiplier = scenario_config['load_multiplier']
+277	            print(f"璐熻嵎鏀惧ぇ鍥犲瓙: {load_multiplier}")
+278	
+279	        predictor = ModelPredictor(model_path, model_type='lstm_transformer')
+280	
+281	        dispatcher = OptimalDispatcher(extreme_config)
+282	
+283	        data_config = self.data_config.copy()
+284	        data_config['feedback_coefficient'] = 0.5
+285	
+286	        optimizer = RollingOptimizer(
+287	            predictor=predictor,
+288	            dispatcher=dispatcher,
+289	            data_config=data_config,
+290	            window_size=96,
+291	            step_size=1
+292	        )
+293	
+294	        results = optimizer.rolling_optimize(
+295	            start_idx=0,
+296	            total_steps=total_steps,
+297	            save_results=False
+298	        )
+299	
+300	        results['experiment_name'] = 'extreme_scenario'
+301	        results['scenario_config'] = scenario_config
+302	
+303	        self.experiment_results['extreme_scenario'] = results
+304	
+305	        print("鏋佺鍦烘櫙娴嬭瘯瀹屾垚")
+306	        return results
+307	
+308	    def compare_experiments(self) -> Dict:
+309	
+310	        if not self.experiment_results:
+311	            print("娌℃湁瀹為獙缁撴灉鍙瘮杈?)
+312	            return {}
+313	
+314	        print("=" * 60)
+315	        print("瀹為獙缁撴灉姣旇緝")
+316	        print("=" * 60)
+317	
+318	        comparison_metrics = {}
+319	
+320	        for exp_name, results in self.experiment_results.items():
+321	            metrics = results.get('overall_metrics', {})
+322	            comparison_metrics[exp_name] = metrics
+323	
+324	        df_comparison = pd.DataFrame(comparison_metrics).T
+325	
+326	        print("\n鎸囨爣姣旇緝:")
+327	        print(df_comparison.to_string(float_format='%.4f'))
+328	
+329	        if 'baseline' in self.experiment_results and 'proposed' in self.experiment_results:
+330	            print("\n姝ｅ湪鐢熸垚璇︾粏鎴愭湰鍒嗘瀽...")
+331	            baseline_results = self.experiment_results['baseline']
+332	            proposed_results = self.experiment_results['proposed']
+333	
+334	            cost_analysis = analyze_experiment_results(
+335	                baseline_results, 
+336	                proposed_results, 
+337	                self.system_config
+338	            )
+339	
+340	            comparison_result = {
+341	                'metrics_comparison': df_comparison.to_dict(),
+342	                'summary': self._generate_summary(),
+343	                'detailed_cost_analysis': cost_analysis
+344	            }
+345	        else:
+346	            comparison_result = {
+347	                'metrics_comparison': df_comparison.to_dict(),
+348	                'summary': self._generate_summary()
+349	            }
+350	
+351	        return comparison_result
+352	
+353	    def _generate_summary(self) -> Dict:
+354	
+355	        if not self.experiment_results:
+356	            return {}
+357	
+358	        summary = {
+359	            'total_experiments': len(self.experiment_results),
+360	            'experiment_names': list(self.experiment_results.keys()),
+361	            'best_performers': {}
+362	        }
+363	
+364	        all_metrics = {}
+365	        for exp_name, results in self.experiment_results.items():
+366	            metrics = results.get('overall_metrics', {})
+367	            for metric, value in metrics.items():
+368	                if isinstance(value, (int, float)):
+369	                    if metric not in all_metrics:
+370	                        all_metrics[metric] = {}
+371	                    all_metrics[metric][exp_name] = value
+372	
+373	        for metric, exp_values in all_metrics.items():
+374	            if 'error' in metric.lower() or 'cost' in metric.lower() or 'mape' in metric.lower():
+375	
+376	                best_exp = min(exp_values.items(), key=lambda x: x[1])
+377	            else:
+378	
+379	                best_exp = max(exp_values.items(), key=lambda x: x[1])
+380	
+381	            summary['best_performers'][metric] = {
+382	                'experiment': best_exp[0],
+383	                'value': best_exp[1]
+384	            }
+385	
+386	        return summary
+387	
+388	    def save_comparison_results(self, save_dir: str = None):
+389	
+390	        if save_dir is None:
+391	            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+392	            save_dir = f"dispatching/results/comparison_{self.area}_{timestamp}"
+393	
+394	        os.makedirs(save_dir, exist_ok=True)
+395	
+396	        for exp_name, results in self.experiment_results.items():
+397	            exp_file = os.path.join(save_dir, f'{exp_name}_results.json')
+398	
+399	            json_results = {}
+400	            for key, value in results.items():
+401	                if isinstance(value, np.ndarray):
+402	                    json_results[key] = value.tolist()
+403	                else:
+404	                    json_results[key] = value
+405	
+406	            with open(exp_file, 'w', encoding='utf-8') as f:
+407	                json.dump(json_results, f, indent=2, ensure_ascii=False)
+408	
+409	        comparison = self.compare_experiments()
+410	        comparison_file = os.path.join(save_dir, 'comparison_results.json')
+411	        with open(comparison_file, 'w', encoding='utf-8') as f:
+412	            json.dump(comparison, f, indent=2, ensure_ascii=False)
+413	
+414	        print(f"\n姣旇緝缁撴灉宸蹭繚瀛樺埌: {save_dir}")
+415	
+416	    def create_visualizations(self, save_dir: str):
+417	
+418	        if not self.experiment_results:
+419	            return
+420	
+421	        plt.style.use('seaborn-v0_8')
+422	
+423	        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+424	        fig.suptitle(f'瀹為獙缁撴灉姣旇緝 - {self.area}', fontsize=16, fontweight='bold')
+425	
+426	        exp_names = []
+427	        prediction_errors = []
+428	        costs = []
+429	
+430	        for exp_name, results in self.experiment_results.items():
+431	            if 'predictions' in results and 'actuals' in results:
+432	                exp_names.append(exp_name)
+433	                errors = np.array(results['errors'])
+434	                prediction_errors.append(np.abs(errors))
+435	                costs.append(results['costs'])
+436	
+437	        if prediction_errors:
+438	            axes[0, 0].boxplot(prediction_errors, labels=exp_names)
+439	            axes[0, 0].set_title('棰勬祴璇樊鍒嗗竷')
+440	            axes[0, 0].set_ylabel('缁濆璇樊 (MW)')
+441	            axes[0, 0].tick_params(axis='x', rotation=45)
+442	
+443	        if costs:
+444	            axes[0, 1].boxplot(costs, labels=exp_names)
+445	            axes[0, 1].set_title('璋冨害鎴愭湰鍒嗗竷')
+446	            axes[0, 1].set_ylabel('鎴愭湰 (楼)')
+447	            axes[0, 1].tick_params(axis='x', rotation=45)
+448	
+449	        mape_values = []
+450	        for exp_name in exp_names:
+451	            metrics = self.experiment_results[exp_name].get('overall_metrics', {})
+452	            mape_values.append(metrics.get('mape', 0))
+453	
+454	        if mape_values:
+455	            bars = axes[1, 0].bar(exp_names, mape_values)
+456	            axes[1, 0].set_title('骞冲潎缁濆鐧惧垎姣旇宸?(MAPE)')
+457	            axes[1, 0].set_ylabel('MAPE (%)')
+458	            axes[1, 0].tick_params(axis='x', rotation=45)
+459	
+460	            for bar, value in zip(bars, mape_values):
+461	                axes[1, 0].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1,
+462	                               f'{value:.2f}%', ha='center', va='bottom')
+463	
+464	        total_costs = []
+465	        for exp_name in exp_names:
+466	            metrics = self.experiment_results[exp_name].get('overall_metrics', {})
+467	            total_costs.append(metrics.get('total_cost', 0))
+468	
+469	        if total_costs:
+470	            bars = axes[1, 1].bar(exp_names, total_costs)
+471	            axes[1, 1].set_title('鎬昏皟搴︽垚鏈?)
+472	            axes[1, 1].set_ylabel('鎬绘垚鏈?(楼)')
+473	            axes[1, 1].tick_params(axis='x', rotation=45)
+474	
+475	            for bar, value in zip(bars, total_costs):
+476	                axes[1, 1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(total_costs)*0.01,
+477	                               f'{value:.0f}', ha='center', va='bottom')
+478	
+479	        plt.tight_layout()
+480	        plt.savefig(os.path.join(save_dir, 'comparison_charts.png'), dpi=300, bbox_inches='tight')
+481	        plt.close()
+482	
+483	        if len(self.experiment_results) >= 2:
+484	            self._create_time_series_comparison(save_dir)
+485	
+486	        print("鍙鍖栧浘琛ㄥ凡鍒涘缓")
+487	
+488	    def _create_time_series_comparison(self, save_dir: str):
+489	
+490	        fig, axes = plt.subplots(3, 1, figsize=(15, 12))
+491	        fig.suptitle('鏃堕棿搴忓垪姣旇緝', fontsize=16, fontweight='bold')
+492	
+493	        colors = ['blue', 'red', 'green', 'orange', 'purple']
+494	
+495	        for i, (exp_name, results) in enumerate(self.experiment_results.items()):
+496	            if i >= len(colors):
+497	                break
+498	
+499	            if 'predictions' in results and 'actuals' in results:
+500	                steps = range(len(results['predictions']))
+501	                color = colors[i]
+502	
+503	                if i == 0:  
+504	                    axes[0].plot(steps, results['actuals'], 'k-', alpha=0.7, label='瀹為檯璐熻嵎', linewidth=1)
+505	
+506	                axes[0].plot(steps, results['predictions'], color=color, label=f'{exp_name} 棰勬祴', alpha=0.8)
+507	
+508	                errors = np.array(results['errors'])
+509	                axes[1].plot(steps, errors, color=color, label=f'{exp_name} 璇樊', alpha=0.8)
+510	
+511	                axes[2].plot(steps, results['costs'], color=color, label=f'{exp_name} 鎴愭湰', alpha=0.8)
+512	
+513	        axes[0].set_title('璐熻嵎棰勬祴瀵规瘮')
+514	        axes[0].set_ylabel('璐熻嵎 (MW)')
+515	        axes[0].legend()
+516	        axes[0].grid(True, alpha=0.3)
+517	
+518	        axes[1].set_title('棰勬祴璇樊瀵规瘮')
+519	        axes[1].set_ylabel('璇樊 (MW)')
+520	        axes[1].legend()
+521	        axes[1].grid(True, alpha=0.3)
+522	        axes[1].axhline(y=0, color='black', linestyle='--', alpha=0.5)
+523	
+524	        axes[2].set_title('璋冨害鎴愭湰瀵规瘮')
+525	        axes[2].set_xlabel('鏃堕棿姝?)
+526	        axes[2].set_ylabel('鎴愭湰 (楼)')
+527	        axes[2].legend()
+528	        axes[2].grid(True, alpha=0.3)
+529	
+530	        plt.tight_layout()
+531	        plt.savefig(os.path.join(save_dir, 'time_series_comparison.png'), dpi=300, bbox_inches='tight')
+532	        plt.close()

@@ -1,0 +1,53 @@
+{
+  "train_metrics": {
+    "MSE": 3714.4878806301404,
+    "RMSE": 60.94659859770798,
+    "MAE": 43.22683093142756,
+    "MAPE": 0.8900455705886897,
+    "R2": 0.9991287408581481,
+    "nRMSE": 0.9182878796011288
+  },
+  "val_metrics": {
+    "MSE": 6133.383614990015,
+    "RMSE": 78.31592184856164,
+    "MAE": 57.555638085126375,
+    "MAPE": 0.8535933767183346,
+    "R2": 0.9985009745079063,
+    "nRMSE": 1.0409823645195362
+  },
+  "test_metrics": {
+    "MSE": 8038.229842114626,
+    "RMSE": 89.65617570538366,
+    "MAE": 67.54147503663857,
+    "MAPE": 0.9924380739935429,
+    "R2": 0.9979516284746593,
+    "nRMSE": 1.1749614854388688
+  },
+  "model_info": {
+    "model_class": "LSTMTransformerModel",
+    "total_parameters": 260929,
+    "trainable_parameters": 260929,
+    "device": "cpu",
+    "optimizer": "Adam",
+    "criterion": "MSELoss",
+    "model_name": "LSTM-Transformer Hybrid",
+    "input_dim": 5,
+    "lstm_hidden_dim": 128,
+    "lstm_layers": 2,
+    "transformer_dim": 32,
+    "transformer_layers": 4,
+    "num_heads": 8,
+    "sequence_length": 96,
+    "output_dim": 1
+  },
+  "best_metrics": {
+    "MSE": 6133.383614990015,
+    "RMSE": 78.31592184856164,
+    "MAE": 57.555638085126375,
+    "MAPE": 0.8535933767183346,
+    "R2": 0.9985009745079063,
+    "nRMSE": 1.0409823645195362,
+    "best_epoch": 31,
+    "best_val_loss": 0.00149608164819392
+  }
+}

@@ -1,0 +1,773 @@
+﻿1	import os
+2	import torch
+3	import numpy as np
+4	import pandas as pd
+5	from typing import Dict, List, Tuple, Optional, Union
+6	from datetime import datetime, timedelta
+7	import json
+8	import warnings
+9	
+10	from dispatching.optimal_dispatch import OptimalDispatcher
+11	from utils.dataset import LoadDataset
+12	from sklearn.preprocessing import StandardScaler
+13	import pickle
+14	
+15	class ModelPredictor:
+16	
+17	    def __init__(self, model_path: str, model_type: str = 'lstm_transformer'):
+18	
+19	        self.model_path = model_path
+20	        self.model_type = model_type
+21	        self.model = None
+22	        self.scaler = None
+23	        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+24	
+25	        self._load_model()
+26	
+27	    def _load_model(self):
+28	
+29	        if not os.path.exists(self.model_path):
+30	            raise FileNotFoundError(f"妯″瀷鏂囦欢涓嶅瓨鍦? {self.model_path}")
+31	
+32	        weights_only_mode = False
+33	        try:
+34	
+35	            checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=True)
+36	            weights_only_mode = True
+37	        except Exception:
+38	
+39	            checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=False)
+40	            weights_only_mode = False
+41	
+42	        if weights_only_mode:
+43	
+44	            model_config = {}
+45	        else:
+46	
+47	            model_config = checkpoint.get('model_config', {})
+48	
+49	        if self.model_type == 'lstm_baseline':
+50	            from models.lstm_baseline import LSTMBaseline
+51	            self.model = LSTMBaseline(
+52	                input_dim=model_config.get('input_dim', 5),
+53	                hidden_dim=model_config.get('hidden_dim', 128),
+54	                num_layers=model_config.get('num_layers', 2),
+55	                output_dim=1,
+56	                dropout=0.1
+57	            )
+58	        elif self.model_type == 'lstm_transformer':
+59	            from models.lstm_transformer import LSTMTransformerModel
+60	            self.model = LSTMTransformerModel(
+61	                input_dim=model_config.get('input_dim', 5),
+62	                lstm_hidden_dim=model_config.get('lstm_hidden_dim', 64),
+63	                lstm_layers=model_config.get('lstm_layers', 2),
+64	                transformer_dim=model_config.get('transformer_dim', 128),
+65	                transformer_layers=model_config.get('transformer_layers', 2),
+66	                num_heads=model_config.get('num_heads', 8),
+67	                sequence_length=model_config.get('sequence_length', 96),
+68	                output_dim=1,
+69	                dropout=0.1
+70	            )
+71	        elif self.model_type == 'de_lstm_baseline':
+72	            from models.de_lstm_baseline import DeLSTMBaseline
+73	            self.model = DeLSTMBaseline(
+74	                input_dim=model_config.get('input_dim', 5),
+75	                hidden_dim=model_config.get('hidden_dim', 128),
+76	                num_layers=model_config.get('num_layers', 2),
+77	                output_dim=1,
+78	                dropout=0.1
+79	            )
+80	        else:
+81	            raise ValueError(f"涓嶆敮鎸佺殑妯″瀷绫诲瀷: {self.model_type}")
+82	
+83	        if weights_only_mode:
+84	
+85	            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+86	                state_dict = checkpoint['model_state_dict']
+87	            else:
+88	                state_dict = checkpoint
+89	        else:
+90	
+91	            state_dict = checkpoint['model_state_dict']
+92	
+93	        state_dict = self._adapt_state_dict(state_dict)
+94	        self.model.load_state_dict(state_dict)
+95	
+96	        self.model.to(self.device)
+97	        self.model.eval()
+98	
+99	        print(f"鎴愬姛鍔犺浇妯″瀷: {self.model_path}")
+100	        print(f"妯″瀷绫诲瀷: {self.model_type}")
+101	        print(f"鍔犺浇妯″紡: {'瀹夊叏妯″紡' if weights_only_mode else '鍏煎妯″紡'}")
+102	        if not weights_only_mode:
+103	            print(f"妯″瀷鍙傛暟: {model_config}")
+104	
+105	    def _adapt_state_dict(self, state_dict: dict) -> dict:
+106	
+107	        adapted_state_dict = state_dict.copy()
+108	
+109	        if self.model_type == 'lstm_baseline':
+110	
+111	            if 'fc.weight' in state_dict and 'fc1.weight' not in state_dict:
+112	                print("妫€娴嬪埌鍗曞眰杈撳嚭缁撴瀯锛岃浆鎹负鍙屽眰缁撴瀯...")
+113	
+114	                fc_weight = state_dict['fc.weight']  
+115	                fc_bias = state_dict['fc.bias']      
+116	
+117	                hidden_dim = fc_weight.shape[1]
+118	                output_dim = fc_weight.shape[0]
+119	
+120	                fc1_out_dim = hidden_dim // 2
+121	
+122	                adapted_state_dict['fc1.weight'] = torch.randn(fc1_out_dim, hidden_dim) * 0.1
+123	                adapted_state_dict['fc1.bias'] = torch.zeros(fc1_out_dim)
+124	
+125	                adapted_state_dict['fc2.weight'] = torch.randn(output_dim, fc1_out_dim) * 0.1
+126	                adapted_state_dict['fc2.bias'] = fc_bias  
+127	
+128	                del adapted_state_dict['fc.weight']
+129	                del adapted_state_dict['fc.bias']
+130	
+131	                print(f"杞崲瀹屾垚: fc({hidden_dim}->{output_dim}) -> fc1({hidden_dim}->{fc1_out_dim}) + fc2({fc1_out_dim}->{output_dim})")
+132	
+133	            elif 'fc1.weight' in state_dict and hasattr(self.model, 'fc') and not hasattr(self.model, 'fc1'):
+134	                print("妫€娴嬪埌鍙屽眰杈撳嚭缁撴瀯锛岃浆鎹负鍗曞眰缁撴瀯...")
+135	
+136	                fc1_weight = state_dict['fc1.weight']  
+137	                fc1_bias = state_dict['fc1.bias']      
+138	                fc2_weight = state_dict['fc2.weight']  
+139	                fc2_bias = state_dict['fc2.bias']      
+140	
+141	                hidden_dim = fc1_weight.shape[1]
+142	                fc1_out_dim = fc1_weight.shape[0]
+143	                output_dim = fc2_weight.shape[0]
+144	
+145	                fc_weight = torch.zeros(output_dim, hidden_dim)
+146	                fc_weight[:, :fc1_out_dim] = fc2_weight
+147	
+148	                adapted_state_dict['fc.weight'] = fc_weight
+149	                adapted_state_dict['fc.bias'] = fc2_bias
+150	
+151	                del adapted_state_dict['fc1.weight']
+152	                del adapted_state_dict['fc1.bias'] 
+153	                del adapted_state_dict['fc2.weight']
+154	                del adapted_state_dict['fc2.bias']
+155	
+156	                print(f"杞崲瀹屾垚: fc1({hidden_dim}->{fc1_out_dim}) + fc2({fc1_out_dim}->{output_dim}) -> fc({hidden_dim}->{output_dim})")
+157	
+158	            elif 'output_layer.weight' in state_dict and 'fc1.weight' not in state_dict:
+159	                print("妫€娴嬪埌de_lstm_baseline鐨刼utput_layer缁撴瀯锛岃浆鎹负鍙屽眰缁撴瀯...")
+160	
+161	                output_weight = state_dict['output_layer.weight']  
+162	                output_bias = state_dict['output_layer.bias']      
+163	
+164	                hidden_dim = output_weight.shape[1]
+165	                output_dim = output_weight.shape[0]
+166	
+167	                fc1_out_dim = hidden_dim // 2
+168	
+169	                adapted_state_dict['fc1.weight'] = torch.randn(fc1_out_dim, hidden_dim) * 0.1
+170	                adapted_state_dict['fc1.bias'] = torch.zeros(fc1_out_dim)
+171	
+172	                adapted_state_dict['fc2.weight'] = torch.randn(output_dim, fc1_out_dim) * 0.1
+173	                adapted_state_dict['fc2.bias'] = output_bias  
+174	
+175	                del adapted_state_dict['output_layer.weight']
+176	                del adapted_state_dict['output_layer.bias']
+177	
+178	                print(f"杞崲瀹屾垚: output_layer({hidden_dim}->{output_dim}) -> fc1({hidden_dim}->{fc1_out_dim}) + fc2({fc1_out_dim}->{output_dim})")
+179	
+180	        elif self.model_type == 'de_lstm_baseline':
+181	
+182	            if 'fc1.weight' in state_dict and 'output_layer.weight' not in state_dict:
+183	                print("妫€娴嬪埌鍙屽眰缁撴瀯锛岃浆鎹负de_lstm_baseline鐨刼utput_layer缁撴瀯...")
+184	
+185	                fc1_weight = state_dict['fc1.weight']  
+186	                fc1_bias = state_dict['fc1.bias']      
+187	                fc2_weight = state_dict['fc2.weight']  
+188	                fc2_bias = state_dict['fc2.bias']      
+189	
+190	                hidden_dim = fc1_weight.shape[1]
+191	                fc1_out_dim = fc1_weight.shape[0]
+192	                output_dim = fc2_weight.shape[0]
+193	
+194	                output_weight = torch.zeros(output_dim, hidden_dim)
+195	                output_weight[:, :fc1_out_dim] = fc2_weight
+196	
+197	                adapted_state_dict['output_layer.weight'] = output_weight
+198	                adapted_state_dict['output_layer.bias'] = fc2_bias
+199	
+200	                del adapted_state_dict['fc1.weight']
+201	                del adapted_state_dict['fc1.bias'] 
+202	                del adapted_state_dict['fc2.weight']
+203	                del adapted_state_dict['fc2.bias']
+204	
+205	                print(f"杞崲瀹屾垚: fc1({hidden_dim}->{fc1_out_dim}) + fc2({fc1_out_dim}->{output_dim}) -> output_layer({hidden_dim}->{output_dim})")
+206	
+207	        return adapted_state_dict
+208	
+209	    def predict(self, input_sequence: np.ndarray) -> float:
+210	
+211	        self.model.eval()
+212	        with torch.no_grad():
+213	
+214	            if len(input_sequence.shape) == 2:
+215	                input_tensor = torch.FloatTensor(input_sequence).unsqueeze(0)  
+216	            else:
+217	                input_tensor = torch.FloatTensor(input_sequence)
+218	
+219	            input_tensor = input_tensor.to(self.device)
+220	
+221	            output = self.model(input_tensor)
+222	            if isinstance(output, tuple):
+223	                output = output[0]  
+224	
+225	            if isinstance(output, torch.Tensor):
+226	                prediction = output.cpu().numpy().flatten()[0]
+227	            elif isinstance(output, (list, tuple)):
+228	                prediction = float(output[0])
+229	            else:
+230	                prediction = float(output)
+231	
+232	        return prediction
+233	
+234	    def predict_batch(self, input_sequences: np.ndarray) -> np.ndarray:
+235	
+236	        self.model.eval()
+237	        with torch.no_grad():
+238	            input_tensor = torch.FloatTensor(input_sequences).to(self.device)
+239	            output = self.model(input_tensor)
+240	            if isinstance(output, tuple):
+241	                output = output[0]
+242	
+243	            if isinstance(output, torch.Tensor):
+244	                predictions = output.cpu().numpy().flatten()
+245	            elif isinstance(output, (list, tuple)):
+246	                predictions = np.array([float(x) for x in output])
+247	            else:
+248	                predictions = np.array([float(output)])
+249	
+250	        return predictions
+251	
+252	class RollingOptimizer:
+253	
+254	    def __init__(self, 
+255	                 predictor: ModelPredictor,
+256	                 dispatcher: OptimalDispatcher,
+257	                 data_config: Dict,
+258	                 window_size: int = 96,
+259	                 step_size: int = 1):
+260	
+261	        self.predictor = predictor
+262	        self.dispatcher = dispatcher
+263	        self.data_config = data_config
+264	        self.window_size = window_size
+265	        self.step_size = step_size
+266	
+267	        self.beta = data_config.get('feedback_coefficient', 0.5)  
+268	
+269	        self.prediction_history = []
+270	        self.actual_history = []
+271	        self.dispatch_history = []
+272	        self.error_history = []
+273	
+274	        self._load_dataset()
+275	
+276	    def _load_dataset(self):
+277	
+278	        area = self.data_config.get('area', 'Area1')
+279	        data_dir = self.data_config.get('data_dir', 'data/processed')
+280	
+281	        test_path = os.path.join(data_dir, f'{area}_test.csv')
+282	        if not os.path.exists(test_path):
+283	            raise FileNotFoundError(f"娴嬭瘯鏁版嵁鏂囦欢涓嶅瓨鍦? {test_path}")
+284	
+285	        self.dataset = LoadDataset(
+286	            data_path=test_path,
+287	            sequence_length=96,
+288	            scaler_type='standard',
+289	            use_time_features=True
+290	        )
+291	
+292	        print(f"鍔犺浇鏁版嵁闆? {test_path}")
+293	        print(f"鏁版嵁闆嗗ぇ灏? {len(self.dataset)} 鏍锋湰")
+294	
+295	        self.raw_data = pd.read_csv(test_path)
+296	        print(f"鍘熷鏁版嵁褰㈢姸: {self.raw_data.shape}")
+297	        print(f"璐熻嵎鏁版嵁鑼冨洿: {self.raw_data['load'].min():.2f} - {self.raw_data['load'].max():.2f} MW")
+298	
+299	    def calculate_compensation(self, prediction_error: float) -> float:
+300	
+301	        return self.beta * prediction_error
+302	
+303	    def rolling_optimize(self, 
+304	                        start_idx: int = 0, 
+305	                        total_steps: int = 100,
+306	                        save_results: bool = True) -> Dict:
+307	
+308	        print("=" * 60)
+309	        print("寮€濮嬫粴鍔ㄤ紭鍖?)
+310	        print("=" * 60)
+311	        print(f"绐楀彛澶у皬: {self.window_size} 鏃舵 (24灏忔椂)")
+312	        print(f"姝ラ暱: {self.step_size} 鏃舵")
+313	        print(f"鎬绘鏁? {total_steps}")
+314	        print(f"鍙嶉绯绘暟 尾: {self.beta}")
+315	        print()
+316	
+317	        results = {
+318	            'predictions': [],
+319	            'actuals': [],
+320	            'dispatches': [],
+321	            'errors': [],
+322	            'compensations': [],
+323	            'costs': [],
+324	            'metrics': [],
+325	            'timestamps': []
+326	        }
+327	
+328	        previous_error = 0.0
+329	
+330	        for step in range(total_steps):
+331	            current_idx = start_idx + step * self.step_size
+332	
+333	            if current_idx + self.window_size >= len(self.raw_data):
+334	                print(f"鍒拌揪鏁版嵁鏈熬锛屽湪绗?{step} 姝ュ仠姝?)
+335	                break
+336	
+337	            try:
+338	
+339	                predictions = self._generate_forecast(current_idx)
+340	
+341	                compensation = self.calculate_compensation(previous_error)
+342	                compensations = np.full(self.window_size, compensation)
+343	
+344	                dispatch_result = self._execute_dispatch(predictions, compensations)
+345	
+346	                actual_load = self._get_actual_load(current_idx)
+347	
+348	                prediction_error = actual_load - predictions[0]  
+349	
+350	                results['predictions'].append(predictions[0])
+351	                results['actuals'].append(actual_load)
+352	                results['dispatches'].append(dispatch_result)
+353	                results['errors'].append(prediction_error)
+354	                results['compensations'].append(compensation)
+355	                results['costs'].append(dispatch_result['total_cost'])
+356	
+357	                step_metrics = self.dispatcher.calculate_metrics(
+358	                    dispatch_result, 
+359	                    np.array([actual_load])
+360	                )
+361	                results['metrics'].append(step_metrics)
+362	
+363	                results['timestamps'].append(current_idx)
+364	
+365	                self.prediction_history.append(predictions[0])
+366	                self.actual_history.append(actual_load)
+367	                self.dispatch_history.append(dispatch_result)
+368	                self.error_history.append(prediction_error)
+369	
+370	                previous_error = prediction_error
+371	
+372	                if (step + 1) % 10 == 0 or step == 0:
+373	                    print(f"Step [{step+1:3d}/{total_steps}] "
+374	                          f"Pred: {predictions[0]:7.2f} MW | "
+375	                          f"Actual: {actual_load:7.2f} MW | "
+376	                          f"Error: {prediction_error:6.2f} MW | "
+377	                          f"Cost: {dispatch_result['total_cost']:8.2f} 楼")
+378	
+379	            except Exception as e:
+380	                print(f"绗?{step} 姝ユ墽琛屽け璐? {e}")
+381	                continue
+382	
+383	        overall_metrics = self._calculate_overall_metrics(results)
+384	        results['overall_metrics'] = overall_metrics
+385	
+386	        print("\n婊氬姩浼樺寲瀹屾垚!")
+387	        print("=" * 60)
+388	        print("鎬讳綋鎸囨爣:")
+389	        for key, value in overall_metrics.items():
+390	            if isinstance(value, float):
+391	                print(f"  {key}: {value:.4f}")
+392	            else:
+393	                print(f"  {key}: {value}")
+394	
+395	        if save_results:
+396	            self._save_results(results)
+397	
+398	        return results
+399	
+400	    def _generate_forecast(self, start_idx: int) -> np.ndarray:
+401	
+402	        predictions = []
+403	
+404	        if start_idx < 96:
+405	
+406	            history_data = self.raw_data.iloc[0:start_idx+96].copy()
+407	        else:
+408	            history_data = self.raw_data.iloc[start_idx-96:start_idx].copy()
+409	
+410	        history_data['datetime'] = pd.to_datetime(history_data['datetime'])
+411	        history_data['quarter_hour'] = ((history_data['datetime'].dt.hour * 4 + 
+412	                                       history_data['datetime'].dt.minute // 15))
+413	
+414	        feature_cols = ['load', 'temp_avg', 'humidity', 'rain', 'quarter_hour']
+415	        input_features = history_data[feature_cols].values
+416	
+417	        input_features_scaled = self.dataset.scaler.transform(input_features)
+418	
+419	        current_sequence = input_features_scaled[-96:]  
+420	
+421	        for i in range(self.window_size):
+422	
+423	            pred_scaled = self.predictor.predict(current_sequence)
+424	
+425	            pred_original = self.dataset.inverse_transform_target([pred_scaled])[0]
+426	            predictions.append(pred_original)
+427	
+428	            if i < self.window_size - 1:
+429	
+430	                next_idx = start_idx + i + 1
+431	                if next_idx < len(self.raw_data):
+432	                    next_row = self.raw_data.iloc[next_idx].copy()
+433	                    next_row['load'] = pred_original  
+434	
+435	                    next_datetime = pd.to_datetime(next_row['datetime'])
+436	                    next_quarter_hour = next_datetime.hour * 4 + next_datetime.minute // 15
+437	
+438	                    next_features = np.array([
+439	                        pred_original,  
+440	                        next_row['temp_avg'],
+441	                        next_row['humidity'], 
+442	                        next_row['rain'],
+443	                        next_quarter_hour
+444	                    ])
+445	
+446	                    next_features_scaled = self.dataset.scaler.transform([next_features])[0]
+447	
+448	                    current_sequence = np.vstack([current_sequence[1:], next_features_scaled])
+449	                else:
+450	
+451	                    last_features = current_sequence[-1].copy()
+452	                    last_features[0] = self.dataset.scaler.transform([[pred_original, 0, 0, 0, 0]])[0][0]
+453	                    current_sequence = np.vstack([current_sequence[1:], last_features])
+454	
+455	        return np.array(predictions)
+456	
+457	    def _execute_dispatch(self, load_forecast: np.ndarray, 
+458	                         compensations: np.ndarray) -> Dict:
+459	
+460	        model = self.dispatcher.create_model(load_forecast, len(load_forecast))
+461	
+462	        solution = self.dispatcher.solve(model, compensations)
+463	
+464	        return solution
+465	
+466	    def _get_actual_load(self, idx: int) -> float:
+467	
+468	        if idx < len(self.raw_data):
+469	            return self.raw_data.iloc[idx]['load']
+470	        else:
+471	            return 0.0
+472	
+473	    def _calculate_overall_metrics(self, results: Dict) -> Dict:
+474	
+475	        if not results['predictions']:
+476	            return {}
+477	
+478	        predictions = np.array(results['predictions'])
+479	        actuals = np.array(results['actuals'])
+480	        errors = np.array(results['errors'])
+481	        costs = np.array(results['costs'])
+482	
+483	        metrics = {
+484	            'total_steps': len(predictions),
+485	            'avg_prediction_error': np.mean(np.abs(errors)),
+486	            'max_prediction_error': np.max(np.abs(errors)),
+487	            'rmse': np.sqrt(np.mean(errors**2)),
+488	            'mape': np.mean(np.abs(errors / actuals)) * 100,
+489	            'total_cost': np.sum(costs),
+490	            'avg_cost_per_step': np.mean(costs),
+491	            'cost_std': np.std(costs)
+492	        }
+493	
+494	        return metrics
+495	
+496	    def _save_results(self, results: Dict):
+497	
+498	        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+499	
+500	        save_dir = f"dispatching/results/rolling_optimization_{timestamp}"
+501	        os.makedirs(save_dir, exist_ok=True)
+502	
+503	        results_file = os.path.join(save_dir, 'rolling_results.json')
+504	
+505	        json_results = {}
+506	        for key, value in results.items():
+507	            if isinstance(value, np.ndarray):
+508	                json_results[key] = value.tolist()
+509	            elif isinstance(value, list):
+510	                json_results[key] = value
+511	            else:
+512	                json_results[key] = value
+513	
+514	        with open(results_file, 'w', encoding='utf-8') as f:
+515	            json.dump(json_results, f, indent=2, ensure_ascii=False)
+516	
+517	        summary_file = os.path.join(save_dir, 'summary_metrics.json')
+518	        with open(summary_file, 'w', encoding='utf-8') as f:
+519	            json.dump(results['overall_metrics'], f, indent=2, ensure_ascii=False)
+520	
+521	        print(f"\n缁撴灉宸蹭繚瀛樺埌: {save_dir}")
+522	        print(f"璇︾粏缁撴灉: {results_file}")
+523	        print(f"鎽樿鎸囨爣: {summary_file}")
+524	
+525	def create_system_config(area: str = 'Area1') -> Dict:
+526	
+527	    if area == 'Area1':
+528	
+529	        peak_load = 12000  
+530	        min_load = 2200    
+531	
+532	        total_capacity = int(peak_load * 1.25)  
+533	
+534	        generators = {
+535	            'Nuclear_1': {
+536	                'p_min': int(total_capacity * 0.05 * 0.8), 
+537	                'p_max': int(total_capacity * 0.05),       
+538	                'cost_b': 5, 'cost_c': 30,    
+539	                'ramp_up': 30, 'ramp_down': 30,    
+540	                'emission_factor': 0.0  
+541	            },
+542	            'Hydro_1': {
+543	                'p_min': int(total_capacity * 0.07 * 0.3), 
+544	                'p_max': int(total_capacity * 0.07),       
+545	                'cost_b': 3, 'cost_c': 15,    
+546	                'ramp_up': 600, 'ramp_down': 600,
+547	                'emission_factor': 0.0  
+548	            },
+549	            'Wind_1': {
+550	                'p_min': 0,  
+551	                'p_max': int(total_capacity * 0.20),        
+552	                'cost_b': 2, 'cost_c': 5,     
+553	                'ramp_up': 1000, 'ramp_down': 1000,  
+554	                'emission_factor': 0.0  
+555	            },
+556	            'Solar_1': {
+557	                'p_min': 0,  
+558	                'p_max': int(total_capacity * 0.15),        
+559	                'cost_b': 1, 'cost_c': 3,     
+560	                'ramp_up': 2000, 'ramp_down': 2000,  
+561	                'emission_factor': 0.0  
+562	            },
+563	            'Gas_1': {
+564	                'p_min': int(total_capacity * 0.08 * 0.2), 
+565	                'p_max': int(total_capacity * 0.08),       
+566	                'cost_b': 40, 'cost_c': 100,  
+567	                'ramp_up': 400, 'ramp_down': 400,
+568	                'emission_factor': 0.4   
+569	            },
+570	            'Coal_1': {
+571	                'p_min': int(total_capacity * 0.45 * 0.2),  
+572	                'p_max': int(total_capacity * 0.45),        
+573	                'cost_b': 50, 'cost_c': 200,  
+574	                'ramp_up': 200, 'ramp_down': 200,
+575	                'emission_factor': 0.85  
+576	            }
+577	        }
+578	
+579	        storage_capacity_ratio = 0.15  
+580	
+581	        storage = {
+582	            'Battery_1': {
+583	                'p_max': int(total_capacity * storage_capacity_ratio * 0.6),  
+584	                'soc_min': int(total_capacity * storage_capacity_ratio * 0.6 * 2 * 0.1),   
+585	                'soc_max': int(total_capacity * storage_capacity_ratio * 0.6 * 2),         
+586	                'initial_soc': int(total_capacity * storage_capacity_ratio * 0.6 * 2 * 0.5), 
+587	                'efficiency': 0.92,  
+588	                'cost_per_mwh': 15   
+589	            },
+590	            'PumpHydro_1': {
+591	                'p_max': int(total_capacity * storage_capacity_ratio * 0.4),  
+592	                'soc_min': int(total_capacity * storage_capacity_ratio * 0.4 * 6 * 0.2),   
+593	                'soc_max': int(total_capacity * storage_capacity_ratio * 0.4 * 6),         
+594	                'initial_soc': int(total_capacity * storage_capacity_ratio * 0.4 * 6 * 0.6), 
+595	                'efficiency': 0.78,  
+596	                'cost_per_mwh': 8    
+597	            }
+598	        }
+599	
+600	        constraints = {
+601	            'carbon_limit': peak_load * 0.48 * 24,  
+602	            'carbon_penalty': 50  
+603	        }
+604	
+605	    else:  
+606	
+607	        max_load = 10000
+608	        generators = {
+609	            'Coal_1': {
+610	                'p_min': 400, 'p_max': 2500,
+611	                'cost_b': 28, 'cost_c': 160,
+612	                'ramp_up': 180, 'ramp_down': 180,
+613	                'emission_factor': 0.85
+614	            },
+615	            'Gas_1': {
+616	                'p_min': 150, 'p_max': 1800,
+617	                'cost_b': 38, 'cost_c': 85,
+618	                'ramp_up': 350, 'ramp_down': 350,
+619	                'emission_factor': 0.42
+620	            },
+621	            'Hydro_1': {
+622	                'p_min': 80, 'p_max': 1200,
+623	                'cost_b': 6, 'cost_c': 25,
+624	                'ramp_up': 500, 'ramp_down': 500,
+625	                'emission_factor': 0.0
+626	            }
+627	        }
+628	
+629	        storage = {
+630	            'Battery_1': {
+631	                'p_max': 400,
+632	                'soc_min': 80, 'soc_max': 1500,
+633	                'initial_soc': 800,
+634	                'efficiency': 0.94,
+635	                'cost_per_mwh': 12
+636	            }
+637	        }
+638	
+639	    config = {
+640	        'generators': generators,
+641	        'storage': storage,
+642	        'constraints': constraints,
+643	        'solver': {
+644	            'name': 'glpk',
+645	            'options': {
+646	
+647	            }
+648	        }
+649	    }
+650	
+651	    return config 
+652	
+653	class EnhancedRollingOptimizer(RollingOptimizer):
+654	
+655	    def __init__(self, predictor: ModelPredictor, dispatcher: OptimalDispatcher, 
+656	                 data_config: Dict, window_size: int = 96, step_size: int = 1,
+657	                 prediction_method: str = 'multi_step'):
+658	
+659	        super().__init__(predictor, dispatcher, data_config, window_size, step_size)
+660	        self.prediction_method = prediction_method
+661	
+662	    def _generate_forecast(self, start_idx: int) -> np.ndarray:
+663	
+664	        if self.prediction_method == 'single_step':
+665	            return self._generate_single_step_forecast(start_idx)
+666	        elif self.prediction_method == 'traditional':
+667	            return self._generate_traditional_forecast(start_idx)
+668	        else:
+669	            return super()._generate_forecast(start_idx)
+670	
+671	    def _generate_single_step_forecast(self, start_idx: int) -> np.ndarray:
+672	
+673	        predictions = []
+674	        feature_cols = ['load', 'temp_avg', 'humidity', 'rain']
+675	
+676	        for i in range(self.window_size):
+677	            current_idx = start_idx + i
+678	
+679	            if current_idx < 96:
+680	
+681	                seq_start = 0
+682	                seq_end = max(1, current_idx)  
+683	            else:
+684	
+685	                seq_start = current_idx - 96
+686	                seq_end = current_idx
+687	
+688	            input_data = self.raw_data.iloc[seq_start:seq_end].copy()
+689	
+690	            if len(input_data) < 96:
+691	                last_row = input_data.iloc[-1] if len(input_data) > 0 else self.raw_data.iloc[0]
+692	                padding_size = 96 - len(input_data)
+693	                padding_data = pd.DataFrame([last_row] * padding_size, columns=input_data.columns)
+694	                input_data = pd.concat([input_data, padding_data], ignore_index=True)
+695	
+696	            input_data['datetime'] = pd.to_datetime(input_data['datetime'])
+697	            input_data['quarter_hour'] = ((input_data['datetime'].dt.hour * 4 + 
+698	                                         input_data['datetime'].dt.minute // 15))
+699	
+700	            feature_cols_with_time = ['load', 'temp_avg', 'humidity', 'rain', 'quarter_hour']
+701	            input_features = input_data[feature_cols_with_time].values
+702	            input_features_scaled = self.dataset.scaler.transform(input_features)
+703	
+704	            try:
+705	                pred_scaled = self.predictor.predict(input_features_scaled)
+706	                pred_original = self.dataset.inverse_transform_target([pred_scaled])[0]
+707	
+708	                if i > 0 and len(self.actual_history) > 0:
+709	                    recent_actual = self.actual_history[-min(3, len(self.actual_history)):]
+710	                    if len(recent_actual) >= 2:
+711	                        trend = (recent_actual[-1] - recent_actual[0]) / len(recent_actual)
+712	                        pred_original += trend * 0.5  
+713	
+714	                pred_original = max(1000, min(20000, pred_original))
+715	                predictions.append(pred_original)
+716	
+717	            except Exception as e:
+718	
+719	                if len(predictions) > 0:
+720	                    predictions.append(predictions[-1])
+721	                elif len(self.actual_history) > 0:
+722	                    predictions.append(self.actual_history[-1])
+723	                else:
+724	                    predictions.append(7000.0)
+725	
+726	        return np.array(predictions)
+727	
+728	    def _generate_traditional_forecast(self, start_idx: int) -> np.ndarray:
+729	
+730	        predictions = []
+731	
+732	        lookback_hours = min(7 * 24 * 4, start_idx)  
+733	        if start_idx >= lookback_hours:
+734	            historical_data = self.raw_data.iloc[start_idx-lookback_hours:start_idx]['load'].values
+735	        else:
+736	            historical_data = self.raw_data.iloc[0:start_idx]['load'].values
+737	
+738	        if len(historical_data) > 0:
+739	            recent_avg = np.mean(historical_data[-96:]) if len(historical_data) >= 96 else np.mean(historical_data)
+740	            recent_trend = 0.0
+741	            if len(historical_data) >= 8:
+742	
+743	                x = np.arange(len(historical_data[-8:]))
+744	                y = historical_data[-8:]
+745	                trend_coef = np.polyfit(x, y, 1)[0]
+746	                recent_trend = trend_coef
+747	        else:
+748	            recent_avg = 7000.0  
+749	            recent_trend = 0.0
+750	
+751	        for i in range(self.window_size):
+752	
+753	            hour_of_day = ((start_idx + i) % (24 * 4)) / 4.0  
+754	
+755	            if 6 <= hour_of_day <= 9 or 18 <= hour_of_day <= 21:
+756	
+757	                pattern_factor = 1.2
+758	            elif 0 <= hour_of_day <= 6 or 22 <= hour_of_day <= 24:
+759	
+760	                pattern_factor = 0.8
+761	            else:
+762	
+763	                pattern_factor = 1.0
+764	
+765	            noise_factor = 1.0 + np.random.normal(0, 0.05)  
+766	
+767	            base_prediction = recent_avg + recent_trend * i
+768	            adjusted_prediction = base_prediction * pattern_factor * noise_factor
+769	
+770	            adjusted_prediction = max(2000, min(15000, adjusted_prediction))
+771	            predictions.append(adjusted_prediction)
+772	
+773	        return np.array(predictions)

@@ -177,11 +177,26 @@ class BaseTrainer(ABC):
 
     def load_model(self, filepath: str, load_optimizer: bool = True):
 
+        def _torch_load_compatible(weights_only_flag):
+
+            load_kwargs = {'map_location': self.device}
+            if weights_only_flag is not None:
+                load_kwargs['weights_only'] = weights_only_flag
+
+            try:
+                return torch.load(filepath, **load_kwargs)
+            except TypeError as e:
+                if 'weights_only' in str(e):
+                    print("检测到当前PyTorch版本不支持weights_only参数，正在使用兼容模式加载...")
+                    load_kwargs.pop('weights_only', None)
+                    return torch.load(filepath, **load_kwargs)
+                raise
+
         try:
-            checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
+            checkpoint = _torch_load_compatible(False)
         except Exception as e:
-            print(f"警告: 使用安全模式加载失败 ({e})，尝试兼容模式...")
-            checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
+            print(f"警告: 使用默认模式加载失败 ({e})，尝试兼容模式...")
+            checkpoint = _torch_load_compatible(None)
 
         self.model.load_state_dict(checkpoint['model_state_dict'])
 

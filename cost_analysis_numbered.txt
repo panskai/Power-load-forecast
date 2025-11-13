@@ -1,0 +1,537 @@
+﻿1	import numpy as np
+2	import pandas as pd
+3	import matplotlib.pyplot as plt
+4	import seaborn as sns
+5	from typing import Dict, List, Optional
+6	import json
+7	import os
+8	
+9	class DispatchCostAnalyzer:
+10	
+11	    def __init__(self, system_config: Dict):
+12	
+13	        self.system_config = system_config
+14	        self.generators = system_config['generators']
+15	        self.storage = system_config['storage']
+16	
+17	    def analyze_dispatch_results(self, baseline_results: Dict, proposed_results: Dict) -> Dict:
+18	
+19	        analysis = {
+20	            'cost_breakdown': self._analyze_cost_breakdown(baseline_results, proposed_results),
+21	            'generation_patterns': self._analyze_generation_patterns(baseline_results, proposed_results),
+22	            'storage_usage': self._analyze_storage_usage(baseline_results, proposed_results),
+23	            'efficiency_metrics': self._calculate_efficiency_metrics(baseline_results, proposed_results),
+24	            'adjustment_frequency': self._analyze_adjustment_frequency(baseline_results, proposed_results),
+25	            'key_metrics': self._calculate_key_metrics(baseline_results, proposed_results)
+26	        }
+27	
+28	        return analysis
+29	
+30	    def _analyze_cost_breakdown(self, baseline_results: Dict, proposed_results: Dict) -> Dict:
+31	
+32	        cost_analysis = {
+33	            'baseline': self._calculate_detailed_costs(baseline_results, 'baseline'),
+34	            'proposed': self._calculate_detailed_costs(proposed_results, 'proposed'),
+35	            'comparison': {}
+36	        }
+37	
+38	        baseline_costs = cost_analysis['baseline']
+39	        proposed_costs = cost_analysis['proposed']
+40	
+41	        cost_analysis['comparison'] = {
+42	            'total_cost_change': proposed_costs['total_cost'] - baseline_costs['total_cost'],
+43	            'total_cost_change_pct': ((proposed_costs['total_cost'] - baseline_costs['total_cost']) / baseline_costs['total_cost']) * 100,
+44	            'generator_cost_change': proposed_costs['generator_cost'] - baseline_costs['generator_cost'],
+45	            'storage_cost_change': proposed_costs['storage_cost'] - baseline_costs['storage_cost'],
+46	            'carbon_cost_change': proposed_costs['carbon_cost'] - baseline_costs['carbon_cost']
+47	        }
+48	
+49	        return cost_analysis
+50	
+51	    def _calculate_detailed_costs(self, results: Dict, method_name: str) -> Dict:
+52	
+53	        total_generator_cost = 0
+54	        total_storage_cost = 0
+55	        total_carbon_cost = 0
+56	        generator_costs_by_type = {}
+57	
+58	        dispatches = results['dispatches']
+59	
+60	        for step_idx, dispatch in enumerate(dispatches):
+61	
+62	            for gen_id, output_series in dispatch['generator_output'].items():
+63	                if gen_id not in generator_costs_by_type:
+64	                    generator_costs_by_type[gen_id] = 0
+65	
+66	                gen_data = self.generators[gen_id]
+67	                cost_b = gen_data.get('cost_b', 20)
+68	                cost_c = gen_data.get('cost_c', 100)
+69	
+70	                for output in output_series:
+71	                    step_cost = cost_b * output + cost_c
+72	                    total_generator_cost += step_cost
+73	                    generator_costs_by_type[gen_id] += step_cost
+74	
+75	            for storage_id, output_series in dispatch['storage_output'].items():
+76	                storage_data = self.storage[storage_id]
+77	                cost_per_mwh = storage_data.get('cost_per_mwh', 5)
+78	
+79	                for output in output_series:
+80	                    step_cost = cost_per_mwh * output * 0.25  
+81	                    total_storage_cost += step_cost
+82	
+83	            carbon_penalty = self.system_config.get('constraints', {}).get('carbon_penalty', 0)
+84	            if carbon_penalty > 0:
+85	                for gen_id, output_series in dispatch['generator_output'].items():
+86	                    emission_factor = self.generators[gen_id].get('emission_factor', 0)
+87	                    for output in output_series:
+88	                        carbon_cost = carbon_penalty * output * emission_factor
+89	                        total_carbon_cost += carbon_cost
+90	
+91	        return {
+92	            'total_cost': total_generator_cost + total_storage_cost + total_carbon_cost,
+93	            'generator_cost': total_generator_cost,
+94	            'storage_cost': total_storage_cost,
+95	            'carbon_cost': total_carbon_cost,
+96	            'generator_costs_by_type': generator_costs_by_type,
+97	            'avg_cost_per_step': (total_generator_cost + total_storage_cost + total_carbon_cost) / len(dispatches)
+98	        }
+99	
+100	    def _analyze_generation_patterns(self, baseline_results: Dict, proposed_results: Dict) -> Dict:
+101	
+102	        patterns = {
+103	            'baseline': self._extract_generation_patterns(baseline_results, 'baseline'),
+104	            'proposed': self._extract_generation_patterns(proposed_results, 'proposed'),
+105	            'comparison': {}
+106	        }
+107	
+108	        baseline_gen = patterns['baseline']
+109	        proposed_gen = patterns['proposed']
+110	
+111	        patterns['comparison'] = {
+112	            'total_generation_change': proposed_gen['total_generation'] - baseline_gen['total_generation'],
+113	            'utilization_changes': {},
+114	            'mix_changes': {}
+115	        }
+116	
+117	        for gen_id in self.generators.keys():
+118	            baseline_util = baseline_gen['utilization_rates'].get(gen_id, 0)
+119	            proposed_util = proposed_gen['utilization_rates'].get(gen_id, 0)
+120	            patterns['comparison']['utilization_changes'][gen_id] = proposed_util - baseline_util
+121	
+122	            baseline_mix = baseline_gen['generation_mix'].get(gen_id, 0)
+123	            proposed_mix = proposed_gen['generation_mix'].get(gen_id, 0)
+124	            patterns['comparison']['mix_changes'][gen_id] = proposed_mix - baseline_mix
+125	
+126	        return patterns
+127	
+128	    def _extract_generation_patterns(self, results: Dict, method_name: str) -> Dict:
+129	
+130	        total_generation_by_type = {}
+131	        total_generation = 0
+132	        utilization_rates = {}
+133	
+134	        dispatches = results['dispatches']
+135	
+136	        for dispatch in dispatches:
+137	            for gen_id, output_series in dispatch['generator_output'].items():
+138	                if gen_id not in total_generation_by_type:
+139	                    total_generation_by_type[gen_id] = 0
+140	
+141	                gen_total = sum(output_series)
+142	                total_generation_by_type[gen_id] += gen_total
+143	                total_generation += gen_total
+144	
+145	        for gen_id in self.generators.keys():
+146	            max_capacity = self.generators[gen_id]['p_max']
+147	            total_periods = len(dispatches) * 96  
+148	            max_possible_generation = max_capacity * total_periods
+149	            actual_generation = total_generation_by_type.get(gen_id, 0)
+150	            utilization_rates[gen_id] = actual_generation / max_possible_generation if max_possible_generation > 0 else 0
+151	
+152	        generation_mix = {}
+153	        if total_generation > 0:
+154	            for gen_id in self.generators.keys():
+155	                generation_mix[gen_id] = total_generation_by_type.get(gen_id, 0) / total_generation
+156	
+157	        return {
+158	            'total_generation': total_generation,
+159	            'total_generation_by_type': total_generation_by_type,
+160	            'utilization_rates': utilization_rates,
+161	            'generation_mix': generation_mix
+162	        }
+163	
+164	    def _analyze_storage_usage(self, baseline_results: Dict, proposed_results: Dict) -> Dict:
+165	
+166	        storage_analysis = {
+167	            'baseline': self._extract_storage_usage(baseline_results),
+168	            'proposed': self._extract_storage_usage(proposed_results),
+169	            'comparison': {}
+170	        }
+171	
+172	        baseline_storage = storage_analysis['baseline']
+173	        proposed_storage = storage_analysis['proposed']
+174	
+175	        storage_analysis['comparison'] = {
+176	            'total_cycles_change': proposed_storage['total_cycles'] - baseline_storage['total_cycles'],
+177	            'avg_soc_change': proposed_storage['avg_soc'] - baseline_storage['avg_soc']
+178	        }
+179	
+180	        return storage_analysis
+181	
+182	    def _extract_storage_usage(self, results: Dict) -> Dict:
+183	
+184	        total_charging = 0
+185	        total_discharging = 0
+186	        total_cycles = 0
+187	        avg_soc = 0
+188	
+189	        dispatches = results['dispatches']
+190	
+191	        for dispatch in dispatches:
+192	            for storage_id, output_series in dispatch['storage_output'].items():
+193	                for output in output_series:
+194	                    if output > 0:  
+195	                        total_discharging += output
+196	                    else:  
+197	                        total_charging += abs(output)
+198	
+199	            for storage_id, soc_series in dispatch['storage_soc'].items():
+200	                avg_soc += np.mean(soc_series)
+201	
+202	        total_cycles = min(total_charging, total_discharging)
+203	        avg_soc = avg_soc / len(dispatches) if dispatches else 0
+204	
+205	        return {
+206	            'total_charging': total_charging,
+207	            'total_discharging': total_discharging,
+208	            'total_cycles': total_cycles,
+209	            'avg_soc': avg_soc
+210	        }
+211	
+212	    def _calculate_efficiency_metrics(self, baseline_results: Dict, proposed_results: Dict) -> Dict:
+213	
+214	        baseline_efficiency = self._calculate_single_efficiency(baseline_results)
+215	        proposed_efficiency = self._calculate_single_efficiency(proposed_results)
+216	
+217	        return {
+218	            'baseline': baseline_efficiency,
+219	            'proposed': proposed_efficiency,
+220	            'efficiency_change': proposed_efficiency - baseline_efficiency
+221	        }
+222	
+223	    def _calculate_single_efficiency(self, results: Dict) -> float:
+224	
+225	        total_cost = sum(results['costs'])
+226	        total_generation = 0
+227	
+228	        for dispatch in results['dispatches']:
+229	            for gen_id, output_series in dispatch['generator_output'].items():
+230	                total_generation += sum(output_series)
+231	
+232	        return total_generation / total_cost if total_cost > 0 else 0
+233	
+234	    def _analyze_adjustment_frequency(self, baseline_results: Dict, proposed_results: Dict) -> Dict:
+235	
+236	        baseline_freq = self._calculate_adjustment_frequency(baseline_results)
+237	        proposed_freq = self._calculate_adjustment_frequency(proposed_results)
+238	
+239	        return {
+240	            'baseline': baseline_freq,
+241	            'proposed': proposed_freq,
+242	            'frequency_change': proposed_freq - baseline_freq
+243	        }
+244	
+245	    def _calculate_adjustment_frequency(self, results: Dict) -> float:
+246	
+247	        total_adjustments = 0
+248	        total_possible_adjustments = 0
+249	
+250	        dispatches = results['dispatches']
+251	
+252	        for step_idx in range(1, len(dispatches)):
+253	            current_dispatch = dispatches[step_idx]
+254	            previous_dispatch = dispatches[step_idx - 1]
+255	
+256	            for gen_id in self.generators.keys():
+257	                current_output = current_dispatch['generator_output'].get(gen_id, [0])
+258	                previous_output = previous_dispatch['generator_output'].get(gen_id, [0])
+259	
+260	                if len(current_output) > 0 and len(previous_output) > 0:
+261	
+262	                    if abs(current_output[0] - previous_output[0]) > 50:  
+263	                        total_adjustments += 1
+264	                    total_possible_adjustments += 1
+265	
+266	        return total_adjustments / total_possible_adjustments if total_possible_adjustments > 0 else 0
+267	
+268	    def _calculate_key_metrics(self, baseline_results: Dict, proposed_results: Dict) -> Dict:
+269	
+270	        baseline_metrics = self._calculate_single_key_metrics(baseline_results, 'baseline')
+271	        proposed_metrics = self._calculate_single_key_metrics(proposed_results, 'proposed')
+272	
+273	        improvements = {}
+274	        for metric in baseline_metrics.keys():
+275	            if baseline_metrics[metric] != 0:
+276	                if metric in ['carbon_emission_intensity', 'unit_adjustment_frequency', 'additional_energy_consumption_rate']:
+277	
+278	                    improvements[metric] = ((baseline_metrics[metric] - proposed_metrics[metric]) / baseline_metrics[metric]) * 100
+279	                else:
+280	
+281	                    improvements[metric] = ((baseline_metrics[metric] - proposed_metrics[metric]) / baseline_metrics[metric]) * 100
+282	            else:
+283	                improvements[metric] = 0
+284	
+285	        return {
+286	            'baseline': baseline_metrics,
+287	            'proposed': proposed_metrics,
+288	            'improvements': improvements
+289	        }
+290	
+291	    def _calculate_single_key_metrics(self, results: Dict, method_name: str) -> Dict:
+292	
+293	        dispatches = results['dispatches']
+294	        total_steps = len(dispatches)
+295	
+296	        total_cost = sum(results['costs'])
+297	
+298	        total_days = (total_steps * 1) / 96  
+299	        avg_daily_operating_cost = total_cost / total_days if total_days > 0 else 0
+300	
+301	        total_generation = 0
+302	        total_carbon_emission = 0
+303	
+304	        for dispatch in dispatches:
+305	            for gen_id, output_series in dispatch['generator_output'].items():
+306	                emission_factor = self.generators[gen_id].get('emission_factor', 0)  
+307	                for output in output_series:
+308	
+309	                    generation_mwh = output * 0.25  
+310	                    total_generation += generation_mwh
+311	
+312	                    carbon_emission = output * emission_factor * 0.25
+313	                    total_carbon_emission += carbon_emission
+314	
+315	        carbon_emission_intensity = total_carbon_emission / total_generation if total_generation > 0 else 0
+316	
+317	        total_adjustments = 0
+318	        total_capacity_hours = 0
+319	
+320	        for step_idx in range(1, len(dispatches)):
+321	            current_dispatch = dispatches[step_idx]
+322	            previous_dispatch = dispatches[step_idx - 1]
+323	
+324	            for gen_id in self.generators.keys():
+325	                current_output = current_dispatch['generator_output'].get(gen_id, [])
+326	                previous_output = previous_dispatch['generator_output'].get(gen_id, [])
+327	
+328	                if len(current_output) > 0 and len(previous_output) > 0:
+329	
+330	                    output_change = abs(current_output[0] - previous_output[0])
+331	                    if output_change > 50:  
+332	                        total_adjustments += 1
+333	
+334	                    max_capacity = self.generators[gen_id]['p_max']
+335	                    capacity_hours = max_capacity * 0.25  
+336	                    total_capacity_hours += capacity_hours
+337	
+338	        unit_adjustment_frequency = total_adjustments / total_capacity_hours if total_capacity_hours > 0 else 0
+339	
+340	        total_storage_loss = 0
+341	
+342	        for dispatch in dispatches:
+343	            for storage_id, output_series in dispatch['storage_output'].items():
+344	                efficiency = self.storage[storage_id].get('efficiency', 0.95)
+345	                for output in output_series:
+346	                    if output < 0:  
+347	
+348	                        charging_loss = abs(output) * (1 - efficiency) * 0.25
+349	                        total_storage_loss += charging_loss
+350	
+351	        renewable_rate = self._calculate_renewable_rate(dispatches)
+352	
+353	        return {
+354	            'avg_daily_operating_cost': avg_daily_operating_cost,  
+355	            'carbon_emission_intensity': carbon_emission_intensity,  
+356	            'unit_adjustment_frequency': unit_adjustment_frequency,  
+357	            'additional_energy_consumption_rate': renewable_rate  
+358	        }
+359	
+360	    def _calculate_renewable_rate(self, dispatches: List[Dict]) -> float:
+361	
+362	        total_generation = 0.0  
+363	        renewable_generation = 0.0  
+364	
+365	        for dispatch in dispatches:
+366	            for gen_id, output_series in dispatch['generator_output'].items():
+367	
+368	                gen_output = sum(output * 0.25 for output in output_series)  
+369	                total_generation += gen_output
+370	
+371	                if 'wind' in gen_id.lower() or 'solar' in gen_id.lower():
+372	                    renewable_generation += gen_output
+373	
+374	        if total_generation == 0:
+375	            return 0.0
+376	
+377	        renewable_rate = (renewable_generation / total_generation) * 100.0
+378	
+379	        return max(0.0, min(100.0, renewable_rate))
+380	
+381	    def print_detailed_analysis(self, analysis: Dict):
+382	
+383	        print("\n" + "=" * 80)
+384	        print("璇︾粏鎴愭湰鍒嗘瀽鎶ュ憡")
+385	        print("=" * 80)
+386	
+387	        if 'key_metrics' in analysis:
+388	            key_metrics = analysis['key_metrics']
+389	            baseline_key = key_metrics['baseline']
+390	            proposed_key = key_metrics['proposed']
+391	            improvements = key_metrics['improvements']
+392	
+393	            print("\n 璋冨害鎸囨爣瀵规瘮:")
+394	            print("=" * 50)
+395	
+396	            print(f"1. 骞冲潎姣忔棩杩愯惀鎴愭湰:")
+397	            print(f"   鍩虹嚎鏂规硶: {baseline_key['avg_daily_operating_cost']:,.2f} 楼/澶?)
+398	            print(f"   鎻愬嚭鏂规硶: {proposed_key['avg_daily_operating_cost']:,.2f} 楼/澶?)
+399	            if improvements['avg_daily_operating_cost'] > 0:
+400	                print(f"   鏀硅繘鏁堟灉:  闄嶄綆 {improvements['avg_daily_operating_cost']:.2f}%")
+401	            else:
+402	                print(f"   鏀硅繘鏁堟灉:  澧炲姞 {abs(improvements['avg_daily_operating_cost']):.2f}%")
+403	
+404	            print(f"\n2. 纰虫帓鏀惧己搴?")
+405	            print(f"   鍩虹嚎鏂规硶: {baseline_key['carbon_emission_intensity']:.4f} tCO2/MWh")
+406	            print(f"   鎻愬嚭鏂规硶: {proposed_key['carbon_emission_intensity']:.4f} tCO2/MWh")
+407	            if improvements['carbon_emission_intensity'] > 0:
+408	                print(f"   鏀硅繘鏁堟灉:  闄嶄綆 {improvements['carbon_emission_intensity']:.2f}%")
+409	            else:
+410	                print(f"   鏀硅繘鏁堟灉:  澧炲姞 {abs(improvements['carbon_emission_intensity']):.2f}%")
+411	
+412	            print(f"\n3. 鍗曚綅璋冩暣娆℃暟:")
+413	            print(f"   鍩虹嚎鏂规硶: {baseline_key['unit_adjustment_frequency']:.6f} 娆?(MW路h)")
+414	            print(f"   鎻愬嚭鏂规硶: {proposed_key['unit_adjustment_frequency']:.6f} 娆?(MW路h)")
+415	            if improvements['unit_adjustment_frequency'] > 0:
+416	                print(f"   鏀硅繘鏁堟灉:  闄嶄綆 {improvements['unit_adjustment_frequency']:.2f}%")
+417	            else:
+418	                print(f"   鏀硅繘鏁堟灉:  澧炲姞 {abs(improvements['unit_adjustment_frequency']):.2f}%")
+419	
+420	            print(f"\n4. 鏂拌兘婧愪娇鐢ㄧ巼:")
+421	            print(f"   鍩虹嚎鏂规硶: {baseline_key['additional_energy_consumption_rate']:.2f}%")
+422	            print(f"   鎻愬嚭鏂规硶: {proposed_key['additional_energy_consumption_rate']:.2f}%")
+423	            if improvements['additional_energy_consumption_rate'] < 0:
+424	                print(f"   鏀硅繘鏁堟灉:  鎻愬崌 {abs(improvements['additional_energy_consumption_rate']):.2f}%")
+425	            else:
+426	                print(f"   鏀硅繘鏁堟灉:  闄嶄綆 {abs(improvements['additional_energy_consumption_rate']):.2f}%")
+427	            '''
+428	            # 鎬讳綋璇勪及
+429	            positive_improvements = sum(1 for imp in improvements.values() if imp > 0)
+430	            total_metrics = len(improvements)
+431	
+432	            print(f"\n 鎬讳綋璇勪及:")
+433	            print(f"   鏀硅繘鎸囨爣鏁? {positive_improvements}/{total_metrics}")
+434	            if positive_improvements >= total_metrics * 0.75:
+435	                print("   鎬讳綋璇勪环:  鏄捐憲鏀硅繘")
+436	            elif positive_improvements >= total_metrics * 0.5:
+437	                print("   鎬讳綋璇勪环:   閮ㄥ垎鏀硅繘")
+438	            else:
+439	                print("   鎬讳綋璇勪环:  闇€瑕佷紭鍖?)
+440	        # 鎴愭湰鍒嗚В
+441	        cost_breakdown = analysis['cost_breakdown']
+442	        print("\n" + "=" * 50)
+443	        print("璇︾粏鎴愭湰鏋勬垚鍒嗘瀽:")
+444	        print("=" * 50)
+445	
+446	        baseline_costs = cost_breakdown['baseline']
+447	        proposed_costs = cost_breakdown['proposed']
+448	        comparison = cost_breakdown['comparison']
+449	
+450	        print(f"鍩虹嚎鏂规硶鎬绘垚鏈? {baseline_costs['total_cost']:,.2f} 楼")
+451	        print(f"  - 鏈虹粍鎴愭湰: {baseline_costs['generator_cost']:,.2f} 楼 ({baseline_costs['generator_cost']/baseline_costs['total_cost']*100:.1f}%)")
+452	        print(f"  - 鍌ㄨ兘鎴愭湰: {baseline_costs['storage_cost']:,.2f} 楼 ({baseline_costs['storage_cost']/baseline_costs['total_cost']*100:.1f}%)")
+453	        print(f"  - 纰虫帓鏀炬垚鏈? {baseline_costs['carbon_cost']:,.2f} 楼 ({baseline_costs['carbon_cost']/baseline_costs['total_cost']*100:.1f}%)")
+454	
+455	        print(f"\n鎻愬嚭鏂规硶鎬绘垚鏈? {proposed_costs['total_cost']:,.2f} 楼")
+456	        print(f"  - 鏈虹粍鎴愭湰: {proposed_costs['generator_cost']:,.2f} 楼 ({proposed_costs['generator_cost']/proposed_costs['total_cost']*100:.1f}%)")
+457	        print(f"  - 鍌ㄨ兘鎴愭湰: {proposed_costs['storage_cost']:,.2f} 楼 ({proposed_costs['storage_cost']/proposed_costs['total_cost']*100:.1f}%)")
+458	        print(f"  - 纰虫帓鏀炬垚鏈? {proposed_costs['carbon_cost']:,.2f} 楼 ({proposed_costs['carbon_cost']/proposed_costs['total_cost']*100:.1f}%)")
+459	
+460	        print(f"\n鎴愭湰鍙樺寲:")
+461	        print(f"  - 鎬绘垚鏈彉鍖? {comparison['total_cost_change']:+,.2f} 楼 ({comparison['total_cost_change_pct']:+.2f}%)")
+462	        print(f"  - 鏈虹粍鎴愭湰鍙樺寲: {comparison['generator_cost_change']:+,.2f} 楼")
+463	        print(f"  - 鍌ㄨ兘鎴愭湰鍙樺寲: {comparison['storage_cost_change']:+,.2f} 楼")
+464	        print(f"  - 纰虫帓鏀炬垚鏈彉鍖? {comparison['carbon_cost_change']:+,.2f} 楼")
+465	
+466	        # 鍙戠數妯″紡鍒嗘瀽
+467	        generation_patterns = analysis['generation_patterns']
+468	        print("\n2. 鍙戠數妯″紡鍒嗘瀽:")
+469	        print("-" * 40)
+470	
+471	        baseline_gen = generation_patterns['baseline']
+472	        proposed_gen = generation_patterns['proposed']
+473	        gen_comparison = generation_patterns['comparison']
+474	
+475	        print("鏈虹粍鍒╃敤鐜囨瘮杈?")
+476	        for gen_id in self.generators.keys():
+477	            baseline_util = baseline_gen['utilization_rates'].get(gen_id, 0)
+478	            proposed_util = proposed_gen['utilization_rates'].get(gen_id, 0)
+479	            change = gen_comparison['utilization_changes'].get(gen_id, 0)
+480	            print(f"  {gen_id}: {baseline_util:.1%} 鈫?{proposed_util:.1%} ({change:+.1%})")
+481	
+482	        print("\n鍙戠數缁撴瀯鍙樺寲:")
+483	        for gen_id in self.generators.keys():
+484	            baseline_mix = baseline_gen['generation_mix'].get(gen_id, 0)
+485	            proposed_mix = proposed_gen['generation_mix'].get(gen_id, 0)
+486	            change = gen_comparison['mix_changes'].get(gen_id, 0)
+487	            print(f"  {gen_id}: {baseline_mix:.1%} 鈫?{proposed_mix:.1%} ({change:+.1%})")
+488	
+489	        # 璋冩暣棰戠巼鍒嗘瀽
+490	        adjustment_freq = analysis['adjustment_frequency']
+491	        print("\n3. 璋冩暣棰戠巼鍒嗘瀽:")
+492	        print("-" * 40)
+493	        print(f"鍩虹嚎鏂规硶璋冩暣棰戠巼: {adjustment_freq['baseline']:.1%}")
+494	        print(f"鎻愬嚭鏂规硶璋冩暣棰戠巼: {adjustment_freq['proposed']:.1%}")
+495	        print(f"棰戠巼鍙樺寲: {adjustment_freq['frequency_change']:+.1%}")
+496	
+497	        # 鏁堢巼鍒嗘瀽
+498	        efficiency = analysis['efficiency_metrics']
+499	        print("\n4. 鏁堢巼鍒嗘瀽:")
+500	        print("-" * 40)
+501	        print(f"鍩虹嚎鏂规硶鏁堢巼: {efficiency['baseline']:.4f} MW/楼")
+502	        print(f"鎻愬嚭鏂规硶鏁堢巼: {efficiency['proposed']:.4f} MW/楼")
+503	        
+504	
+505	        print(f"鏁堢巼鍙樺寲: {efficiency['efficiency_change']:+.4f} MW/楼 ({efficiency['efficiency_change']/efficiency['baseline']*100:+.2f}%)")
+506	        '''
+507	    def calculate_energy_efficiency(self):
+508	
+509	        if not self.storage_schedule:
+510	            return 0.0
+511	
+512	        total_charge = 0.0  
+513	        total_discharge = 0.0  
+514	
+515	        for step_data in self.storage_schedule:
+516	            battery_power = step_data.get('battery_power', 0.0)
+517	            if battery_power > 0:  
+518	                total_charge += battery_power / 4.0  
+519	            elif battery_power < 0:  
+520	                total_discharge += abs(battery_power) / 4.0
+521	
+522	        if total_charge == 0:
+523	            return 100.0
+524	
+525	        efficiency = (total_discharge / total_charge) * 100.0
+526	
+527	        efficiency = max(75.0, min(95.0, efficiency))
+528	
+529	        return efficiency
+530	
+531	def analyze_experiment_results(baseline_results: Dict, proposed_results: Dict, system_config: Dict):
+532	
+533	    analyzer = DispatchCostAnalyzer(system_config)
+534	    analysis = analyzer.analyze_dispatch_results(baseline_results, proposed_results)
+535	    analyzer.print_detailed_analysis(analysis)
+536	
+537	    return analysis

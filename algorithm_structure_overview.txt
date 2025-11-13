@@ -1,0 +1,106 @@
+﻿项目结构说明
+====================
+
+【根目录】
+- README.md：概述项目目标、运行步骤与依赖安装方式。
+- run_dispatching_experiments.py：串联预测模型与调度模块，完成基线/提出方法的对比实验，可选保存结果。
+- train_de_lstm_baseline.py：训练降级版LSTM与Simple LSTM基线模型，负责数据载入、模型构建、训练及测试指标落盘。
+- train_lstm_baseline.py：训练标准LSTM基线模型，支持时间特征、早停、学习率调度和评估结果导出。
+- train_lstm_transformer.py：训练LSTM-Transformer混合模型，管理混合结构的训练流程与评估记录。
+
+【data/ 数据处理】
+- data_preprocess.py：读取原始Excel负荷与天气数据，清洗合并、补全时间粒度，并按区域导出训练/验证/测试集以及说明文档。
+- raw/Load_ALL.xlsx：原始的多区域负荷与气象数据源。
+- processed/Area*_*.csv：按区域划分的预处理全量数据及其训练/验证/测试拆分，供模型训练与评估使用。
+- processed/README.txt：记录数据处理时间、字段含义及各CSV文件用途。
+
+【models/ 模型定义】
+- de_lstm_baseline.py：实现降级版LSTM与Simple LSTM，用于构建性能受限的参照模型并输出模型元信息。
+- lstm_baseline.py：定义标准多层单向LSTM回归模型，带Dropout与两层全连接预测头。
+- lstm_transformer.py：实现LSTM+Transformer混合模型、位置编码与多头注意力，支持获取注意力权重。
+- __pycache__/：Python自动生成的字节码缓存，可忽略。
+
+【trainers/ 训练框架】
+- base_trainer.py：封装通用训练循环、验证评估、早停逻辑、模型保存/加载及指标追踪工具。
+- lstm_trainer.py：针对纯LSTM模型的训练器，实现前向、反向与验证阶段细节。
+- lstm_transformer_trainer.py：面向混合模型的训练器，实现带注意力输出的训练/验证流程。
+- __pycache__/：缓存文件。
+
+【utils/ 工具】
+- dataset.py：定义序列数据集加载、时间特征构造、标准化及DataLoader创建方法。
+- metrics.py：提供误差指标计算、格式化输出、模型对比与训练指标跟踪器。
+- __pycache__/：缓存文件。
+
+【dispatching/ 优化调度模块】
+- 模块目标：将负荷预测结果转化为可执行的机组+储能调度计划，在满足供需平衡、机组出力约束和储能SOC等物理限制条件下，最小化运行成本并量化不同预测模型带来的调度收益。
+- 工作流程：
+  1. **预测加载** (olling_optimization.ModelPredictor)：根据权重路径识别模型类型（降级LSTM、基线LSTM、LSTM-Transformer），恢复模型结构与归一化参数，在GPU/CPU间自适应运行。
+  2. **滚动预测** (RollingOptimizer/EnhancedRollingOptimizer)：以96点（24小时）滑动窗口生成未来负荷曲线，支持误差反馈与传统预测兜底，维护预测/真实/误差/成本等历史数据。
+  3. **调度建模与求解** (optimal_dispatch.OptimalDispatcher)：用Pyomo构建日内调度模型，包含供需平衡、机组最小/最大出力、爬坡速率、储能充放电与SOC约束，目标函数为机组/储能成本（可含碳排罚金）；默认调用GLPK求解并解析机组功率、储能功率、SOC及总成本等结果。
+  4. **结果记录** (RollingOptimizer.rolling_optimize)：逐步执行“预测→求解→更新”闭环，保存预测值、实际值、误差、成本、储能状态等JSON数据，为后续比较与分析提供原始素材。
+  5. **实验对比** (comparative_experiments.ExperimentComparator)：分别以基线模型和提出模型执行滚动调度，比较MAPE、平均误差、总成本、成本下降百分比等指标，可选导出JSON、生成箱线图/柱状图/时间序列图，并联动成本分析模块。
+  6. **成本诊断** (cost_analysis.DispatchCostAnalyzer)：对调度结果进行机组/储能/碳排成本拆分、利用率/发电结构统计、储能效率与调整频率分析，输出改进总结报告。
+- optimal_dispatch.py：以Pyomo建立包含机组、储能、碳排约束的日内调度模型；定义机组功率、储能功率、SOC 等决策变量，加入供需平衡、出力上下限、爬坡速率、储能容量与转换效率约束，构造线性运行成本目标函数并调用求解器（默认GLPK，支持扩展）求解，最终解析出机组/储能时序计划及成本、平衡等指标。
+- rolling_optimization.py：
+  * ModelPredictor：根据模型路径自动判别模型类型并加载对应结构；处理权重命名差异、恢复归一化器，支持在 GPU/CPU 间切换。
+  * RollingOptimizer：负责滚动窗口调度流程——读取负荷数据、构造滑动窗口、调用预测器生成未来负荷、交由调度器求解，并跟踪预测值、真实值、误差、成本、储能SOC等时序指标；支持结果持久化输出。
+  * EnhancedRollingOptimizer：在基类基础上加入单步预测、传统统计预测和误差反馈修正等策略，提供预测失败的兜底机制，增强调度稳定性。
+  * create_system_config / clone_config：生成或复制机组、储能、成本、约束参数的配置字典，为不同实验场景提供统一的系统输入。
+  * 辅助函数：包含数据加载、误差修正、预测边界保护、日志打印等工具，确保滚动优化过程鲁棒。
+- comparative_experiments.py：
+  * ExperimentComparator：负责基线（传统调度）与提出方法（协同滚动优化）的全流程试验。它自动识别模型类型、调用 ModelPredictor 与 OptimalDispatcher 组装滚动调度器，统一管理实验参数与结果缓存。
+  * 实验执行：un_baseline_experiment 与 un_proposed_experiment 分别加载基线/提出模型，运行滚动优化，收集预测序列、成本、约束违背情况及整体指标，并存储在 experiment_results 字典中。
+  * 结果对比：compare_experiments 汇总各实验的MAPE、平均误差、总成本、碳排罚金等指标，计算改进率，并支持导出 aseline_results.json / proposed_results.json / comparison_results.json。
+  * 可视化：create_visualizations 与 _create_time_series_comparison 生成预测误差箱线图、成本箱线图、MAPE/成本柱状图及负荷/误差/成本时间序列对比图，用于报告展示。
+  * 成本分析：generate_analysis_report 可调用 cost_analysis.analyze_experiment_results，输出机组成本拆解、储能利用率、效率等深度诊断结论。
+  * 辅助功能：包括模型类型检测、实验结果快照保存、参数克隆等工具，便于批量试验管理和调试。
+- cost_analysis.py：
+  * DispatchCostAnalyzer：对滚动调度得到的 dispatches 数据进行逐步解析，计算机组成本、储能成本、碳排成本分项，统计机组利用率、发电结构、储能充放电模式与调整频率，输出关键效率指标。
+  * analyze_dispatch_results：综合成本、利用率、储能、效率、调整频率等维度，返回结构化分析报告（字典），供上层模块复用。
+  * print_detailed_analysis：将分析结果转写为易读的文字报告，包含成本拆分、机组利用率变化、储能策略评述、效率变化及总体评价。
+  * analyze_experiment_results：对比基线与提出方法的调度结果，生成改进总结，可直接被 comparative_experiments 调用。
+  * 辅助函数：如 calculate_energy_efficiency 等，用于计算储能循环效率、格式化输出，支持更深入的运行诊断。
+- requirements.txt：列出调度模块所需的第三方依赖及求解器说明：
+  * pyomo>=6.4.0：构建并求解优化调度模型的核心库；
+  * 
+umpy / pandas / scikit-learn：提供数值计算、数据处理与统计工具；
+  * 	orch：用于加载训练得到的预测模型权重并执行前向推理；
+  * matplotlib / seaborn：生成调度结果与比较图表；
+  * 求解器提示：推荐通过 conda install -c conda-forge glpk 安装 GLPK 以运行线性规划，如需其他性能特性可切换到 CBC、CPLEX、Gurobi 等兼容求解器；注释指出部分可选依赖仅在图表绘制或深度分析时才需安装。
+- results/comparison_*/：按时间戳归档每次滚动调度实验的输出目录，通常包含：
+  * aseline_results.json：记录基线模型的逐步预测值、实际负荷、误差序列、调度成本、储能SOC、约束状态等；
+  * proposed_results.json：存放提出方法对应的同类数据，并体现误差反馈或协同优化带来的变化；
+  * comparison_results.json：汇总两组实验的整体指标、改进百分比、成本/误差对比结果和可视化辅助数据；
+  * comparison_charts.png、	ime_series_comparison.png 等图像：展示误差分布、成本分布、MAPE/总成本柱状图以及负荷/误差/成本时间序列对比；
+  * 该目录可用于回溯任意一次实验的预测表现与调度效果，也可直接供论文图表或报告引用。
+- __pycache__/：缓存文件。
+
+【checkpoints/ 训练快照】
+- de_lstm_baseline/：按时间戳保存最新降级LSTM实验配置（如config.json等）。
+- lstm_transformer/：保存最新混合模型的best_model.pth与config.json。
+
+【de_lstm_baseline/ 历史实验归档】
+- de_lstm_Area1_*/、simple_lstm_Area1_*/：按时间戳划分的旧实验目录，内含config.json、final_model.pth、training_history.json等训练产物。
+- checkpoints：占位文件，标示模型保存位置。
+
+【lstm_baseline/ 历史实验归档】
+- lstm_baseline_Area1_*/：各次LSTM基线实验的结果目录，包含超参数配置、模型权重及评估记录。
+
+【lstm_transformer/ 历史实验归档】
+- lstm_transformer_Area1_*/：混合模型历史实验目录，保存配置、最优模型及评估指标。
+
+【checkpoints/ 子目录说明】
+- 每个时间戳目录内的config.json：保存训练时的超参数与运行信息。
+- best_model.pth/final_model.pth：模型权重文件，分别对应最佳验证表现与最终权重。
+- training_history.json、evaluation_results.json：记录损失曲线、数据集指标及最佳指标快照。
+
+【dispatching/results/ JSON 内容】
+- baseline_results.json：基线模型在调度实验中的逐步预测、成本、约束与指标记录。
+- proposed_results.json：提出方法对应的详细调度、预测与成本数据。
+- comparison_results.json：综合比较两类实验的整体指标、改进幅度及可视化所需数据。
+
+【其他】
+- checkpoints、models、trainers等目录下的__pycache__：运行时产生的字节码缓存。
+- .idea/：PyCharm项目配置与检查规则。
+
+说明：以上结构帮助快速定位数据处理、模型训练、优化调度与历史实验结果，便于理解算法流程并复现实验。

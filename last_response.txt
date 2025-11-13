@@ -1,0 +1,1 @@
+﻿`algorithm_structure_overview.txt:1` 现已将 `results/comparison_*/` 的说明扩展到具体内容：列明每个 JSON 及图像文件的含义、记录的数据字段，以及这些结果目录如何用于回溯实验和生成报告。如需进一步列出 JSON 中的关键字段示例，请继续告诉我。

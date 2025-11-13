@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 from datetime import datetime
+from joblib import dump
 
 from models.lstm_transformer import LSTMTransformerModel
 from trainers.lstm_transformer_trainer import LSTMTransformerTrainer
@@ -123,6 +124,18 @@ def main():
     print(f"训练集样本数: {len(datasets['train']):,}")
     print(f"验证集样本数: {len(datasets['val']):,}")
     print(f"测试集样本数: {len(datasets['test']):,}")
+
+    scaler_path = os.path.join(save_dir, 'scaler.pkl')
+    dump(datasets['train'].scaler, scaler_path)
+    feature_path = os.path.join(save_dir, 'feature_columns.json')
+    with open(feature_path, 'w', encoding='utf-8') as f:
+        json.dump({
+            'feature_columns': datasets['train'].feature_columns,
+            'sequence_length': args.sequence_length,
+            'scaler_type': args.scaler_type
+        }, f, indent=2, ensure_ascii=False)
+    print(f"标准化器已保存至: {scaler_path}")
+    print(f"特征配置已保存至: {feature_path}")
 
     print(f"\n正在创建LSTM-Transformer模型...")
     model = LSTMTransformerModel(
