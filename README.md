@@ -54,8 +54,3 @@ python run_dispatching_experiments.py \
     python run_dispatching_experiments.py  --area Area1   --baseline_model checkpoints/de_lstm_baseline/de_lstm_Area1_20250705_110332/final_model.pth   --proposed_model checkpoints/lstm_transformer/lstm_transformer_Area1_20250705_100953/final_model.pth  --total_steps 100 --feedback_coefficient 0.1  --save_results 
 ```
 
-
-
-
-
-"# Power-load-forecast" 
