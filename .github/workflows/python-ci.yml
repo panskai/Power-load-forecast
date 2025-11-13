@@ -31,7 +31,7 @@ jobs:
       # 4. 运行测试（最简单的 sanity test）
       - name: Run tests
         run: |
-          test_sanity
+          pytest
           
       # 5. 构建 Docker 镜像（验证 Dockerfile 没问题）
       - name: Build Docker image
